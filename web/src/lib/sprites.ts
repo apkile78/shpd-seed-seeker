@@ -2,7 +2,7 @@ import type { CSSProperties } from "react";
 import spriteBounds from "../generated/sprite-bounds.json";
 import type { Glow } from "./glow";
 
-const SHEET_URL = "/third_party/shattered-pixel-dungeon/items.png";
+const SHEET_URL = `${import.meta.env.BASE_URL}third_party/shattered-pixel-dungeon/items.png`;  
 const SHEET_COLUMNS = 16;
 const CELL = 16;
 
@@ -12,7 +12,7 @@ const bounds: Record<string, number[]> = spriteBounds;
 // small type glyph overlaid on top — never by colour. The glyphs live in a
 // separate 8×8-cell atlas; these constants and per-glyph art sizes mirror the
 // Android client's Components.kt so the two stay pixel-identical.
-const ICON_SHEET_URL = "/third_party/shattered-pixel-dungeon/item_icons.png";
+const ICON_SHEET_URL = `${import.meta.env.BASE_URL}third_party/shattered-pixel-dungeon/item_icons.png`;
 const ICON_COLUMNS = 16;
 const ICON_CELL = 8;
 
