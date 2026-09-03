@@ -95,7 +95,7 @@ pub enum ScoutCallError {
 
 /// Validates an `SSQ2` scout request (`magic[4]`, little-endian challenge
 /// `u16`, remaining UTF-8 seed code) or a legacy raw-seed request, generates a
-/// depth-24 world with the supplied generator, and encodes `SSC3`.
+/// depth-24 world with the supplied generator, and encodes `SSC2`.
 ///
 /// # Errors
 ///
@@ -164,7 +164,7 @@ pub enum ScoutMatchError {
 /// reports which of its items satisfy the query in `query_packet`.
 ///
 /// The world is generated exactly like [`production_scout_packet`]'s, so the
-/// reported item indices address the item list of the `SSC3` packet that
+/// reported item indices address the item list of the `SSC2` packet that
 /// request produces.
 ///
 /// # Errors
@@ -179,21 +179,6 @@ pub fn production_scout_matches(
     let query = decode_query(query_packet).map_err(ScoutMatchError::Query)?;
     let world = production_scout_world(seed, challenges).map_err(|_| ScoutMatchError::Panicked)?;
     Ok(scout_matches(&world, &query))
-}
-
-/// Logical processors available to search workers, never less than one.
-/// Frontends read their worker-selector ceiling from here so the engine and
-/// its UI agree on what "all cores" means.
-#[must_use]
-pub fn available_workers() -> usize {
-    SearchOptions::available_parallelism().get()
-}
-
-/// The worker count a session actually spawns: the request clamped to the
-/// host's parallelism, or every available core when the caller passes `None`.
-fn effective_workers(requested: Option<NonZeroUsize>) -> NonZeroUsize {
-    let available = SearchOptions::available_parallelism();
-    requested.map_or(available, |workers| workers.min(available))
 }
 
 /// Re-verifies specific seeds against a full query, returning the matching
@@ -295,7 +280,7 @@ pub enum FilterPacketError {
 }
 
 /// Decodes two query requests and reports whether `candidate`
-/// continues `base`: an identical depth and challenge set, world
+/// continues `base`: an identical depth, challenge set and fast mode, world
 /// conditions (the blacksmith flags and the Wandmaker filter) at least as
 /// strict as the base's, and every requirement of `base` covered by a distinct
 /// candidate requirement at least as strict (equal or strengthened).
@@ -360,22 +345,17 @@ impl NativeSession {
         })
     }
 
-    /// Starts the canonical full-range production search. `workers` is the
-    /// number of search threads to spawn, clamped to the host's parallelism;
-    /// `None` uses every available core.
+    /// Starts the canonical full-range production search.
     ///
     /// # Errors
     ///
     /// Returns [`SearchError`] if workers cannot be spawned.
-    pub fn production(
-        query: SearchQuery,
-        workers: Option<NonZeroUsize>,
-    ) -> Result<Self, SearchError> {
+    pub fn production(query: SearchQuery) -> Result<Self, SearchError> {
         let match_probability = estimate_match_probability(&query);
         let options = SearchOptions {
             start_seed: 0,
             end_seed_exclusive: TOTAL_SEEDS,
-            workers: effective_workers(workers),
+            workers: SearchOptions::available_parallelism(),
             chunk_size: NonZeroUsize::new(SEARCH_CHUNK_SIZE).unwrap_or(NonZeroUsize::MIN),
             max_results: NonZeroUsize::new(MAX_RESULTS).unwrap_or(NonZeroUsize::MIN),
         };
@@ -394,12 +374,9 @@ impl NativeSession {
     /// # Errors
     ///
     /// Distinguishes invalid wire requests from worker spawn failures.
-    pub fn production_from_packet(
-        request: &[u8],
-        workers: Option<NonZeroUsize>,
-    ) -> Result<Self, StartSessionError> {
+    pub fn production_from_packet(request: &[u8]) -> Result<Self, StartSessionError> {
         let query = decode_query(request).map_err(StartSessionError::Request)?;
-        Self::production(query, workers).map_err(StartSessionError::Spawn)
+        Self::production(query).map_err(StartSessionError::Spawn)
     }
 
     /// Starts a production search which resumes a previous traversal: it scans
@@ -416,13 +393,12 @@ impl NativeSession {
         query: SearchQuery,
         resume_from: u64,
         scan_len: u64,
-        workers: Option<NonZeroUsize>,
     ) -> Result<Self, SearchError> {
         let match_probability = estimate_match_probability(&query);
         let options = SearchOptions {
             start_seed: 0,
             end_seed_exclusive: TOTAL_SEEDS,
-            workers: effective_workers(workers),
+            workers: SearchOptions::available_parallelism(),
             chunk_size: NonZeroUsize::new(SEARCH_CHUNK_SIZE).unwrap_or(NonZeroUsize::MIN),
             max_results: NonZeroUsize::new(MAX_RESULTS).unwrap_or(NonZeroUsize::MIN),
         };
@@ -445,11 +421,9 @@ impl NativeSession {
         request: &[u8],
         resume_from: u64,
         scan_len: u64,
-        workers: Option<NonZeroUsize>,
     ) -> Result<Self, StartSessionError> {
         let query = decode_query(request).map_err(StartSessionError::Request)?;
-        Self::production_resumed(query, resume_from, scan_len, workers)
-            .map_err(StartSessionError::Spawn)
+        Self::production_resumed(query, resume_from, scan_len).map_err(StartSessionError::Spawn)
     }
 
     /// Where and how much a follow-up traversal must scan to finish this
@@ -630,20 +604,11 @@ mod tests {
     use shpd_seedfinder_core::query::{
         EffectRequirement, Requirement, SearchQuery, TierRequirement, UpgradeRequirement,
     };
-    use shpd_seedfinder_core::run::RingGems;
     use shpd_seedfinder_core::search::{SearchOptions, WorldGenerator};
     use shpd_seedfinder_core::seed::DungeonSeed;
-    use shpd_seedfinder_core::wire::{WireError, decode_scout_world};
+    use shpd_seedfinder_core::wire::{WireError, decode_scout_world, encode_query};
 
     use super::*;
-
-    /// The request bytes a frontend sends for a query: its canonical JSON
-    /// document.
-    fn query_request(query: &SearchQuery) -> Vec<u8> {
-        shpd_seedfinder_core::json_query::encode(query)
-            .to_string()
-            .into_bytes()
-    }
 
     struct MatchingGenerator;
     impl WorldGenerator for MatchingGenerator {
@@ -722,7 +687,6 @@ mod tests {
                 accessibility: Accessibility::Independent,
                 secret: true,
             }],
-            ring_gems: RingGems::UNSHUFFLED,
         }
     }
     fn query() -> SearchQuery {
@@ -746,6 +710,7 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         }
     }
 
@@ -909,6 +874,7 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         };
 
         let matches = filter_matching_seeds(&satisfiable, &[seed.value()]).unwrap();
@@ -946,25 +912,41 @@ mod tests {
         let seed = DungeonSeed::from_code("AAA-AAA-AAF").unwrap();
         let world = production_scout_world(seed, Challenges::NONE).unwrap();
         let known = world.items.first().cloned().unwrap();
+        let mut request = b"SSF9".to_vec();
+        request.push(known.depth); // max_depth
+        request.push(0); // flags
+        request.extend_from_slice(&[0, 0]); // challenges
+        request.push(0); // any Wandmaker quest
+        request.extend_from_slice(&[0, 1]); // one requirement
         let definition = shpd_seedfinder_core::catalog::item(known.item);
-        let request = format!(
-            r#"{{"max_depth":{},"requirements":[{{"item":"{}"}}]}}"#,
-            known.depth, definition.stable_id
-        );
+        let kind_byte = match definition.kind {
+            shpd_seedfinder_core::catalog::ItemKind::Weapon => 0,
+            shpd_seedfinder_core::catalog::ItemKind::Armor => 1,
+            shpd_seedfinder_core::catalog::ItemKind::Wand => 2,
+            shpd_seedfinder_core::catalog::ItemKind::Ring => 3,
+        };
+        request.push(kind_byte);
+        let id = definition.stable_id.as_bytes();
+        request.extend_from_slice(&u16::try_from(id.len()).unwrap().to_be_bytes());
+        request.extend_from_slice(id);
+        request.extend_from_slice(&[0, 0]); // tier any
+        request.extend_from_slice(&[0, 0]); // upgrade any
+        request.push(0); // any effect
+        // source, identity group, depth, alternative group, sum group, sum
+        // total, flags
+        request.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0]);
 
-        let packet = production_filter_packet(request.as_bytes(), &[seed.value()]).unwrap();
+        let packet = production_filter_packet(&request, &[seed.value()]).unwrap();
         assert_eq!(&packet[..4], b"SSR1");
         assert_eq!(u16::from_be_bytes([packet[4], packet[5]]), 1);
         assert_eq!(
-            production_filter_packet(request.as_bytes(), &[]).unwrap(),
+            production_filter_packet(&request, &[]).unwrap(),
             b"SSR1\0\0"
         );
-        assert!(matches!(
+        assert_eq!(
             production_filter_packet(b"bad!????????", &[seed.value()]),
-            Err(FilterPacketError::Request(WireError::InvalidQueryDocument(
-                _
-            )))
-        ));
+            Err(FilterPacketError::Request(WireError::BadMagic))
+        );
     }
 
     #[test]
@@ -992,8 +974,9 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         };
-        let session = NativeSession::production_resumed(impossible, 42, 1_000, None).unwrap();
+        let session = NativeSession::production_resumed(impossible, 42, 1_000).unwrap();
         wait(&session);
         assert_eq!(session.status()[0], STATE_COMPLETED);
         assert_eq!(session.resume_hint(), [42, 1_000]);
@@ -1084,6 +1067,7 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         }
     }
 
@@ -1225,7 +1209,7 @@ mod tests {
     }
 
     #[test]
-    fn start_decisions_travel_as_query_documents_and_lowercase_names() {
+    fn start_decisions_travel_as_ssf8_packets_and_lowercase_names() {
         let target = kind_query(ItemKind::Ring);
         let detached = kind_query(ItemKind::Armor);
         let mut narrowed = detached.clone();
@@ -1235,7 +1219,7 @@ mod tests {
         });
         let mut deeper = target.clone();
         deeper.max_depth = 9;
-        let packet = query_request;
+        let packet = |query: &SearchQuery| encode_query(query).unwrap();
 
         for (candidate, base, decision, name) in [
             (&target, None, StartDecision::TargetRefine, "target-refine"),

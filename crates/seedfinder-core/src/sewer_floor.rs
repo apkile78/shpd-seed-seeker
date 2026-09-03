@@ -234,7 +234,6 @@ fn generate_sewer_world_with_roots(
         seed,
         items,
         quests: quests.summary(),
-        ring_gems: run.appearances.ring_gems,
     })
 }
 
@@ -1146,7 +1145,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn aaa_floor_one_full_painted_map_matches_official_v400_oracle() {
+    fn aaa_floor_one_full_painted_map_matches_official_v338_oracle() {
         let mut run = RunState::new(0);
         let mut limited = LimitedDrops::default();
         let mut random = RandomStack::with_base_seed(0);
@@ -1155,12 +1154,11 @@ mod tests {
         let floor = paint_sewer_floor(&mut run, &mut limited, 1, &mut random).unwrap();
 
         assert_eq!(floor.prepared.feeling, Feeling::None);
-        assert_eq!((floor.level.width(), floor.level.height()), (37, 43));
-        // Painted map before createMobs tramples the high grass under mobs.
-        assert_eq!(floor.level.java_map_hash(), 268_543_026);
-        assert_eq!(floor.level.entrance(), Some(278));
-        assert_eq!(floor.level.exit(), Some(974));
-        assert_eq!(floor.rooms.len(), 13);
+        assert_eq!((floor.level.width(), floor.level.height()), (40, 30));
+        assert_eq!(floor.level.java_map_hash(), -188_128_262);
+        assert_eq!(floor.level.entrance(), Some(287));
+        assert_eq!(floor.level.exit(), Some(596));
+        assert_eq!(floor.rooms.len(), 12);
         let special_mobs = floor
             .equipment_events
             .iter()
@@ -1182,11 +1180,11 @@ mod tests {
                 .filter(|event| matches!(event, ConsumablePaintEvent::Drop { .. }))
                 .count();
         assert_eq!(special_mobs, 3, "PoolRoom paints three piranhas");
-        assert_eq!(special_heaps, 4, "Pool and Runestone paint four heaps");
+        assert_eq!(special_heaps, 3, "Pool and Runestone paint three heaps");
     }
 
     #[test]
-    fn aaa_floor_one_mobs_and_searchable_items_match_official_v400_oracle() {
+    fn aaa_floor_one_mobs_and_searchable_items_match_official_v338_oracle() {
         let mut run = RunState::new(0);
         let mut limited = LimitedDrops::default();
         let mut quests = QuestState::new();
@@ -1206,29 +1204,29 @@ mod tests {
         assert_eq!(
             mobs,
             [
-                (SewerMobKind::Rat, 289),
-                (SewerMobKind::Rat, 465),
-                (SewerMobKind::Rat, 534),
-                (SewerMobKind::Albino, 574),
-                (SewerMobKind::Snake, 818),
-                (SewerMobKind::Rat, 834),
-                (SewerMobKind::Snake, 1090),
-                (SewerMobKind::Rat, 1376),
+                (SewerMobKind::Rat, 175),
+                (SewerMobKind::Snake, 404),
+                (SewerMobKind::Rat, 497),
+                (SewerMobKind::Rat, 524),
+                (SewerMobKind::Rat, 738),
+                (SewerMobKind::Rat, 752),
+                (SewerMobKind::Snake, 778),
+                (SewerMobKind::Rat, 902),
             ]
         );
-        assert_eq!(floor.regular_items.placements.len(), 6);
-        assert_eq!(floor.world_items.len(), 3);
-        assert_eq!(floor.world_items[0].item, ItemId::ThrowingSpear);
-        assert_eq!(floor.world_items[0].upgrade, 2);
-        assert_eq!(floor.painted.level.java_map_hash(), -72_472_821);
+        assert_eq!(floor.regular_items.placements.len(), 8);
+        assert_eq!(floor.world_items.len(), 1);
+        assert_eq!(floor.world_items[0].item, ItemId::ScaleArmor);
+        assert_eq!(floor.world_items[0].upgrade, 0);
+        assert_eq!(floor.painted.level.java_map_hash(), -188_128_262);
     }
 
     #[test]
-    fn three_more_floor_one_maps_match_official_v400_oracle() {
+    fn three_more_floor_one_maps_match_official_v338_oracle() {
         for (code, expected_size, expected_hash) in [
-            ("AAA-AAA-AAB", (29, 33), 1_897_109_935),
-            ("ABC-DEF-GHI", (43, 29), 912_887_823),
-            ("ZZZ-ZZZ-ZZZ", (33, 35), 192_758_585),
+            ("AAA-AAA-AAB", (37, 38), 714_538_507),
+            ("ABC-DEF-GHI", (38, 28), -536_401_596),
+            ("ZZZ-ZZZ-ZZZ", (32, 42), 963_133_431),
         ] {
             let seed = DungeonSeed::from_code(code).unwrap();
             let seed = i64::try_from(seed.value()).unwrap();
@@ -1248,9 +1246,11 @@ mod tests {
             assert_eq!(floor.painted.level.java_map_hash(), expected_hash, "{code}");
 
             let mut expected_items = match code {
-                "AAA-AAA-AAB" => Vec::new(),
-                "ABC-DEF-GHI" => vec![(ItemId::Quarterstaff, 1)],
-                "ZZZ-ZZZ-ZZZ" => vec![(ItemId::Sickle, 0)],
+                "AAA-AAA-AAB" => vec![(ItemId::Sword, 0), (ItemId::Shuriken, 0)],
+                "ABC-DEF-GHI" => Vec::new(),
+                "ZZZ-ZZZ-ZZZ" => {
+                    vec![(ItemId::ThrowingClub, 0), (ItemId::ScaleArmor, 0)]
+                }
                 _ => unreachable!(),
             };
             let mut actual_items = floor
@@ -1263,9 +1263,9 @@ mod tests {
             assert_eq!(actual_items, expected_items, "{code}");
 
             let expected_mob_cells: &[usize] = match code {
-                "AAA-AAA-AAB" => &[222, 283, 402, 504, 582, 619, 644, 746],
-                "ABC-DEF-GHI" => &[224, 449, 455, 665, 709, 710, 742, 975],
-                "ZZZ-ZZZ-ZZZ" => &[255, 256, 279, 345, 472, 868, 947, 983],
+                "AAA-AAA-AAB" => &[103, 139, 550, 751, 789, 862, 914, 942],
+                "ABC-DEF-GHI" => &[132, 473, 538, 585, 589, 665, 717, 857],
+                "ZZZ-ZZZ-ZZZ" => &[184, 188, 237, 331, 484, 534, 597, 775],
                 _ => unreachable!(),
             };
             let mut actual_mob_cells = floor
@@ -1280,16 +1280,16 @@ mod tests {
     }
 
     #[test]
-    fn aaa_sequential_sewer_maps_match_official_v400_oracle() {
+    fn aaa_sequential_sewer_maps_match_official_v338_oracle() {
         let mut run = RunState::new(0);
         let mut limited = LimitedDrops::default();
         let mut quests = QuestState::new();
         let mut random = RandomStack::with_base_seed(0);
         for (depth, expected_size, expected_hash, expected_mobs) in [
-            (1, (37, 43), -72_472_821, 11),
-            (2, (35, 48), 1_525_181_381, 6),
-            (3, (36, 36), 954_760_830, 7),
-            (4, (47, 40), 1_019_761_352, 8),
+            (1, (40, 30), -188_128_262, 11),
+            (2, (37, 48), -1_411_436_327, 7),
+            (3, (36, 43), -1_000_158_352, 6),
+            (4, (47, 40), 177_881_339, 9),
         ] {
             random.push(seed_for_depth(0, depth, 0));
             let floor =
@@ -1341,25 +1341,19 @@ mod tests {
                 .collect::<Vec<_>>();
             actual_items.sort_unstable();
             let mut expected_items = match depth {
-                1 => vec![
-                    (ItemId::ThrowingSpear, 2),
-                    (ItemId::Shuriken, 0),
-                    (ItemId::WandFrost, 0),
-                ],
-                2 => vec![
-                    (ItemId::Kunai, 0),
-                    (ItemId::MailArmor, 1),
-                    (ItemId::Spear, 0),
-                ],
+                1 => vec![(ItemId::ScaleArmor, 0)],
+                2 => vec![(ItemId::LeatherArmor, 1), (ItemId::MailArmor, 2)],
                 3 => vec![
-                    (ItemId::Sai, 1),
-                    (ItemId::Crossbow, 0),
-                    (ItemId::Whip, 2),
-                    (ItemId::MailArmor, 2),
-                    (ItemId::LeatherArmor, 0),
+                    (ItemId::ScaleArmor, 0),
+                    (ItemId::Spear, 1),
                     (ItemId::RingTenacity, 0),
                 ],
-                4 => Vec::new(),
+                4 => vec![
+                    (ItemId::Quarterstaff, 1),
+                    (ItemId::LeatherArmor, 1),
+                    (ItemId::HandAxe, 1),
+                    (ItemId::Tomahawk, 1),
+                ],
                 _ => unreachable!(),
             };
             expected_items.sort_unstable();
@@ -1380,7 +1374,7 @@ mod tests {
         let batched = generator.generate_batch(&seeds, 4);
 
         assert_eq!(batched, scalar);
-        assert_eq!(scalar[0].items.len(), 12);
+        assert_eq!(scalar[0].items.len(), 10);
         assert_eq!(scalar[0].seed, DungeonSeed::MIN);
     }
 
@@ -1406,6 +1400,7 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         };
         let options = SearchOptions {
             start_seed: 0,

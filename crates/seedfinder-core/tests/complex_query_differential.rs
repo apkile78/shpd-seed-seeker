@@ -19,7 +19,6 @@ use shpd_seedfinder_core::query::{
     UpgradeRequirement, scout_matches,
 };
 use shpd_seedfinder_core::quests::QuestSummary;
-use shpd_seedfinder_core::run::RingGems;
 use shpd_seedfinder_core::seed::DungeonSeed;
 
 const POOL: [ItemId; 8] = [
@@ -110,7 +109,6 @@ fn random_world(rng: &mut Rng) -> GeneratedWorld {
         seed: DungeonSeed::MIN,
         items,
         quests: QuestSummary::default(),
-        ring_gems: RingGems::UNSHUFFLED,
     }
 }
 
@@ -170,16 +168,12 @@ fn random_query(rng: &mut Rng) -> Option<SearchQuery> {
         }
     }
     if rng.chance(40) {
-        // Put every single-member ring slot into one level-sum group;
-        // members are optional in the matcher, so any subset may carry the
-        // total. Only rings may combine levels, and validation caps the
-        // total at one +4 ring plus +2 for every further member.
+        // Put every single-member slot into one level-sum group; members are
+        // optional in the matcher, so any subset may carry the total.
         let singles: Vec<usize> = requirements
             .iter()
             .enumerate()
-            .filter(|(_, requirement)| {
-                requirement.alternative_group.is_none() && requirement.kind == ItemKind::Ring
-            })
+            .filter(|(_, requirement)| requirement.alternative_group.is_none())
             .map(|(index, _)| index)
             .collect();
         if singles.len() >= 2 {
@@ -187,8 +181,7 @@ fn random_query(rng: &mut Rng) -> Option<SearchQuery> {
                 .iter()
                 .map(|&index| u16::from(requirements[index].maximum_level()))
                 .sum();
-            let attainable = capacity.min(5 + 3 * (u16::try_from(singles.len()).unwrap() - 1));
-            let minimum_total = 1 + u8::try_from(rng.below(usize::from(attainable))).unwrap();
+            let minimum_total = 1 + u8::try_from(rng.below(usize::from(capacity))).unwrap();
             for index in singles {
                 requirements[index].level_sum = Some(LevelSum {
                     group: 1,
@@ -209,6 +202,7 @@ fn random_query(rng: &mut Rng) -> Option<SearchQuery> {
                 require_blacksmith: false,
                 exclude_blacksmith_rewards: false,
                 wandmaker_quest: None,
+                fast_mode: false,
             };
             query.slots()
         };
@@ -243,6 +237,7 @@ fn random_query(rng: &mut Rng) -> Option<SearchQuery> {
         require_blacksmith: false,
         exclude_blacksmith_rewards: rng.chance(20),
         wandmaker_quest: None,
+        fast_mode: false,
     };
     query.validate().ok().map(|()| query)
 }

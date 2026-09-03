@@ -1,60 +1,310 @@
 //! Dependency-free binary protocol shared with the Android JNI adapter.
-//!
-//! Queries no longer have a binary form: every query-taking bridge call takes
-//! the canonical JSON query document of [`crate::json_query`], which
-//! frontends already build for share links and results files. What stays
-//! binary is what the bridges hand back or take as a seed: `SSR1` result
-//! batches, `SSQ2` scouting requests and `SSC3` scouted worlds.
 
 use std::fmt;
 
-use crate::catalog::{Effect, item, item_by_stable_id};
+use crate::catalog::{Effect, ItemKind, WeaponCategory, item, item_by_stable_id};
 use crate::challenges::Challenges;
 use crate::model::{Accessibility, GeneratedWorld, ItemSource, WorldItem};
-#[cfg(feature = "json-query")]
-use crate::query::SearchQuery;
+use crate::query::{
+    EffectRequirement, EffectSet, LevelSum, Requirement, SearchQuery, TierRequirement,
+    UpgradeRequirement,
+};
 use crate::quests::{
-    BlacksmithQuestType, GhostQuestType, ImpQuestType, QuestSummary, ScheduledQuest,
+    BlacksmithQuestType, GhostQuestType, ImpTarget, QuestSummary, ScheduledQuest,
     WandmakerQuestType,
 };
-use crate::run::RingGems;
 use crate::seed::DungeonSeed;
 
+const REQUEST_MAGIC: &[u8; 4] = b"SSF9";
 const SCOUT_REQUEST_MAGIC_V2: &[u8; 4] = b"SSQ2";
-/// Ring classes, and so gem-table bytes, in one `SSC3` packet.
-const RING_GEM_COUNT: usize = 12;
 const RESULT_MAGIC: &[u8; 4] = b"SSR1";
-const SCOUT_RESULT_MAGIC: &[u8; 4] = b"SSC3";
-/// Requirement ceiling of a bridge request; far above anything the UIs
-/// produce, and what the retired binary layout's count field could hold.
-#[cfg(feature = "json-query")]
+const SCOUT_RESULT_MAGIC: &[u8; 4] = b"SSC2";
 const MAX_REQUIREMENTS: usize = 64;
+/// Effect-list ceiling; both effect families define 21 modifiers.
+const MAX_EFFECTS: usize = 32;
 
-/// Decodes a search request: the canonical JSON query document of
-/// [`crate::json_query`], which frontends already build for share links and
-/// results files and can therefore hand to every query-taking bridge call
-/// without a second encoder. A UTF-8 byte-order mark and leading whitespace,
-/// which some platform JSON writers emit, are tolerated.
+/// Decodes a search request: an `SSF9` packet, or — when the request starts
+/// with `{` — the canonical JSON query document of [`crate::json_query`],
+/// which frontends already build for share links and results files and can
+/// therefore hand to every query-taking bridge call without a second encoder.
+///
+/// In the binary form the flags byte uses bit 0 for required blacksmith
+/// availability, bit 1 for the lossy fast search mode described on
+/// [`SearchQuery::fast_mode`], and bit 2 to prevent Blacksmith "Smith" rewards
+/// from satisfying item requirements. The byte after the challenge mask is the
+/// required Wandmaker quest — `0` for any, otherwise the variant's one-based
+/// game value. Each requirement carries an effect predicate (mode byte 0 for
+/// any, or 1 followed by a count and that many same-family wire names), an
+/// alternative-group byte, a combined-level group byte and total, and ends
+/// with a flags byte whose bit 0 requires the matching item to be uncursed.
 ///
 /// # Errors
 ///
-/// Returns [`WireError::InvalidUtf8`] for a request that is not UTF-8,
-/// [`WireError::InvalidRequirementCount`] for more than 64 requirements, and
-/// otherwise surfaces the query codec's own message as
-/// [`WireError::InvalidQueryDocument`] — for malformed JSON, unknown fields,
-/// items or effects, and inconsistent queries alike — so bridges can show the
-/// user which requirement or field is wrong.
-#[cfg(feature = "json-query")]
+/// Returns [`WireError`] for malformed lengths/UTF-8, unknown IDs or effects,
+/// invalid upgrades, trailing data, or an inconsistent query; a JSON document
+/// the query codec rejects surfaces the codec's own message as
+/// [`WireError::InvalidQueryDocument`], so bridges can show the user which
+/// requirement or field is wrong.
 pub fn decode_query(packet: &[u8]) -> Result<SearchQuery, WireError> {
-    let document = packet.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(packet);
-    let document = document.trim_ascii_start();
-    let contents = std::str::from_utf8(document).map_err(|_| WireError::InvalidUtf8)?;
-    let query = crate::json_query::decode(contents).map_err(WireError::InvalidQueryDocument)?;
-    if query.requirements.len() > MAX_REQUIREMENTS {
-        return Err(WireError::InvalidRequirementCount);
+    #[cfg(feature = "json-query")]
+    {
+        // Tolerate a UTF-8 byte-order mark and leading whitespace, which
+        // some platform JSON writers emit, before sniffing for a document.
+        let document = packet.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(packet);
+        let document = document.trim_ascii_start();
+        if document.first() == Some(&b'{') {
+            let contents = std::str::from_utf8(document).map_err(|_| WireError::InvalidUtf8)?;
+            let query =
+                crate::json_query::decode(contents).map_err(WireError::InvalidQueryDocument)?;
+            // The same ceiling as the binary layout's count field.
+            if query.requirements.len() > MAX_REQUIREMENTS {
+                return Err(WireError::InvalidRequirementCount);
+            }
+            return Ok(query);
+        }
     }
+    let mut input = Input::new(packet);
+    if input.take(4)? != REQUEST_MAGIC {
+        return Err(WireError::BadMagic);
+    }
+    let query = decode_query_payload(&mut input)?;
+    if !input.is_empty() {
+        return Err(WireError::TrailingData);
+    }
+    query.validate().map_err(|_| WireError::InvalidQuery)?;
     Ok(query)
 }
+
+/// Encodes a validated query using the `SSF9` request schema.
+///
+/// # Errors
+///
+/// Returns [`WireError`] when the query is invalid, has too many requirements,
+/// or contains a string that cannot fit the protocol's `u16` length field.
+pub fn encode_query(query: &SearchQuery) -> Result<Vec<u8>, WireError> {
+    query.validate().map_err(|_| WireError::InvalidQuery)?;
+    let count =
+        u16::try_from(query.requirements.len()).map_err(|_| WireError::InvalidRequirementCount)?;
+    if usize::from(count) > MAX_REQUIREMENTS {
+        return Err(WireError::InvalidRequirementCount);
+    }
+    let mut output = Vec::new();
+    output.extend_from_slice(REQUEST_MAGIC);
+    output.push(query.max_depth);
+    output.push(
+        u8::from(query.require_blacksmith)
+            | (u8::from(query.fast_mode) << 1)
+            | (u8::from(query.exclude_blacksmith_rewards) << 2),
+    );
+    output.extend_from_slice(&query.challenges.bits().to_le_bytes());
+    output.push(query.wandmaker_quest.map_or(0, WandmakerQuestType::wire_id));
+    output.extend_from_slice(&count.to_be_bytes());
+    for requirement in &query.requirements {
+        output.push(requirement_kind_wire_id(
+            requirement.kind,
+            requirement.weapon_category,
+        ));
+        push_utf8_u16(
+            &mut output,
+            requirement
+                .item
+                .map_or("", |item_id| item(item_id).stable_id),
+        )?;
+        let (tier_mode, tier_value) = match requirement.tier {
+            TierRequirement::Any => (0, 0),
+            TierRequirement::Exact(value) => (1, value),
+            TierRequirement::AtLeast(value) => (2, value),
+            TierRequirement::AtMost(value) => (3, value),
+        };
+        output.extend_from_slice(&[tier_mode, tier_value]);
+        let (upgrade_mode, upgrade_value) = match requirement.upgrade {
+            UpgradeRequirement::Any => (0, 0),
+            UpgradeRequirement::Exact(value) => (1, value),
+            UpgradeRequirement::AtLeast(value) => (2, value),
+        };
+        output.extend_from_slice(&[upgrade_mode, upgrade_value]);
+        match requirement.effect {
+            EffectRequirement::Any => output.push(0),
+            EffectRequirement::OneOf(set) => {
+                output.push(1);
+                // Sets are non-empty by construction and hold at most 32
+                // members (a u32 mask), so the count always fits.
+                output.push(set.count());
+                for effect in set.effects() {
+                    push_utf8_u16(&mut output, effect.wire_name())?;
+                }
+            }
+        }
+        output.push(
+            requirement
+                .source
+                .map_or(0, |source| source_wire_id(source) + 1),
+        );
+        output.push(requirement.identity_group.unwrap_or(0));
+        output.push(requirement.max_depth.unwrap_or(0));
+        output.push(requirement.alternative_group.unwrap_or(0));
+        let (sum_group, sum_total) = requirement
+            .level_sum
+            .map_or((0, 0), |sum| (sum.group, sum.minimum_total));
+        output.extend_from_slice(&[sum_group, sum_total]);
+        output.push(u8::from(requirement.require_uncursed));
+    }
+    Ok(output)
+}
+
+fn decode_query_payload(input: &mut Input<'_>) -> Result<SearchQuery, WireError> {
+    let max_depth = input.u8()?;
+    let flags = input.u8()?;
+    if flags & !0b111 != 0 {
+        return Err(WireError::InvalidFlags);
+    }
+    let challenges = Challenges::new(input.u16_le()?).map_err(|_| WireError::InvalidChallenges)?;
+    let wandmaker_quest = match input.u8()? {
+        0 => None,
+        value => {
+            Some(WandmakerQuestType::from_wire_id(value).ok_or(WireError::UnknownQuestVariant)?)
+        }
+    };
+    let count = usize::from(input.u16()?);
+    if count == 0 || count > MAX_REQUIREMENTS {
+        return Err(WireError::InvalidRequirementCount);
+    }
+    let mut requirements = Vec::with_capacity(count);
+    for _ in 0..count {
+        requirements.push(decode_requirement(input)?);
+    }
+    Ok(SearchQuery {
+        requirements,
+        max_depth,
+        challenges,
+        require_blacksmith: flags & 1 != 0,
+        exclude_blacksmith_rewards: flags & 0b100 != 0,
+        wandmaker_quest,
+        fast_mode: flags & 0b10 != 0,
+    })
+}
+
+fn decode_requirement(input: &mut Input<'_>) -> Result<Requirement, WireError> {
+    let (kind, weapon_category) =
+        requirement_kind_from_wire_id(input.u8()?).ok_or(WireError::UnknownItemKind)?;
+    let stable_id = input.utf8_u16()?;
+    let item = if stable_id.is_empty() {
+        None
+    } else {
+        Some(
+            item_by_stable_id(stable_id)
+                .ok_or(WireError::UnknownItem)?
+                .id,
+        )
+    };
+    let tier_mode = input.u8()?;
+    let tier_value = input.u8()?;
+    let tier = match tier_mode {
+        0 if tier_value == 0 => TierRequirement::Any,
+        1 => TierRequirement::Exact(tier_value),
+        2 => TierRequirement::AtLeast(tier_value),
+        3 => TierRequirement::AtMost(tier_value),
+        _ => return Err(WireError::InvalidTierMode),
+    };
+    let upgrade_mode = input.u8()?;
+    let upgrade_value = input.u8()?;
+    let upgrade = match upgrade_mode {
+        0 if upgrade_value == 0 => UpgradeRequirement::Any,
+        1 => UpgradeRequirement::Exact(upgrade_value),
+        2 => UpgradeRequirement::AtLeast(upgrade_value),
+        _ => return Err(WireError::InvalidUpgradeMode),
+    };
+    let effect = match input.u8()? {
+        0 => EffectRequirement::Any,
+        1 => {
+            let members = usize::from(input.u8()?);
+            if members == 0 || members > MAX_EFFECTS {
+                return Err(WireError::InvalidEffectSet);
+            }
+            let mut effects = Vec::with_capacity(members);
+            for _ in 0..members {
+                let name = input.utf8_u16()?;
+                effects.push(Effect::from_wire_name(kind, name).ok_or(WireError::UnknownModifier)?);
+            }
+            EffectRequirement::OneOf(
+                EffectSet::from_effects(effects).ok_or(WireError::InvalidEffectSet)?,
+            )
+        }
+        _ => return Err(WireError::InvalidEffectSet),
+    };
+    let source = match input.u8()? {
+        0 => None,
+        value => Some(source_from_wire_id(value - 1).ok_or(WireError::UnknownItemSource)?),
+    };
+    let identity_group = match input.u8()? {
+        0 => None,
+        value => Some(value),
+    };
+    let requirement_max_depth = match input.u8()? {
+        0 => None,
+        value => Some(value),
+    };
+    let alternative_group = match input.u8()? {
+        0 => None,
+        value => Some(value),
+    };
+    let sum_group = input.u8()?;
+    let sum_total = input.u8()?;
+    let level_sum = match (sum_group, sum_total) {
+        (0, 0) => None,
+        (0, _) => return Err(WireError::InvalidLevelSum),
+        (group, minimum_total) => Some(LevelSum {
+            group,
+            minimum_total,
+        }),
+    };
+    let requirement_flags = input.u8()?;
+    if requirement_flags & !1 != 0 {
+        return Err(WireError::InvalidFlags);
+    }
+    Ok(Requirement {
+        kind,
+        weapon_category,
+        item,
+        tier,
+        upgrade,
+        effect,
+        require_uncursed: requirement_flags & 1 != 0,
+        source,
+        identity_group,
+        max_depth: requirement_max_depth,
+        alternative_group,
+        level_sum,
+    })
+}
+
+/// Requirement kind IDs. `0..=3` are the original four families; `4` and `5`
+/// were added for melee/thrown weapon filters, so packets from older
+/// frontends (which only emit `0..=3`) keep decoding to the same queries.
+const fn requirement_kind_from_wire_id(id: u8) -> Option<(ItemKind, Option<WeaponCategory>)> {
+    Some(match id {
+        0 => (ItemKind::Weapon, None),
+        1 => (ItemKind::Armor, None),
+        2 => (ItemKind::Wand, None),
+        3 => (ItemKind::Ring, None),
+        4 => (ItemKind::Weapon, Some(WeaponCategory::Melee)),
+        5 => (ItemKind::Weapon, Some(WeaponCategory::Thrown)),
+        _ => return None,
+    })
+}
+
+const fn requirement_kind_wire_id(kind: ItemKind, category: Option<WeaponCategory>) -> u8 {
+    match (kind, category) {
+        (ItemKind::Weapon, None) => 0,
+        (ItemKind::Weapon, Some(WeaponCategory::Melee)) => 4,
+        (ItemKind::Weapon, Some(WeaponCategory::Thrown)) => 5,
+        // A category with a non-weapon kind never survives validation.
+        (ItemKind::Armor, _) => 1,
+        (ItemKind::Wand, _) => 2,
+        (ItemKind::Ring, _) => 3,
+    }
+}
+
 /// Encodes the seed-only `SSR1` result batch consumed by Android.
 ///
 /// # Errors
@@ -123,11 +373,10 @@ pub fn decode_scout_seed(request: &[u8]) -> Result<DungeonSeed, WireError> {
 
 /// Encodes every searchable item in one generated world for scouting mode.
 ///
-/// `SSC3` is big-endian and self-delimiting:
+/// `SSC2` is big-endian and self-delimiting:
 ///
 /// ```text
 /// magic[4], seed:utf8_u8,
-/// ring_gems[12],
 /// quest_count:u8,
 /// repeated { quest:u8, variant:u8, depth:u8 },
 /// item_count:u16,
@@ -138,20 +387,12 @@ pub fn decode_scout_seed(request: &[u8]) -> Result<DungeonSeed, WireError> {
 /// }
 /// ```
 ///
-/// `ring_gems` is the run's [`RingGems::ordinals`]: one gem ordinal per ring
-/// class, in the catalog's ring order. It rides with the manifest because it is
-/// a property of the same run — like the quests, and unlike anything an item
-/// carries — and because a frontend that draws a ring from its catalog cell
-/// alone shows the same twelve colours for every seed. `SSC3` replaces `SSC2`,
-/// which had no room for it.
-///
 /// Quest entries are emitted in strictly ascending quest order — Ghost `1`,
 /// Wandmaker `2`, Blacksmith `3`, Imp `4` — and each quest appears at most
 /// once. Variants reuse the game's one-based values: Ghost fetid rat `1`,
 /// gnoll trickster `2`, great crab `3`; Wandmaker corpse dust `1`, elemental
-/// embers `2`, rotberry `3`; Blacksmith crystal `1`, gnoll `2`; Imp vault `1`
-/// (its only 4.0.0 variant). The depth byte is the quest giver's canonical
-/// floor.
+/// embers `2`, rotberry `3`; Blacksmith crystal `1`, gnoll `2`; Imp monk `1`,
+/// golem `2`. The depth byte is the quest giver's canonical floor.
 ///
 /// Accessibility payloads are empty for independent items, `group:u16,
 /// option:u8` for choices, and `group:u16, mask:u64` for explicit scenarios.
@@ -171,7 +412,6 @@ pub fn encode_scout_world(world: &GeneratedWorld) -> Result<Vec<u8>, WireError> 
     output.extend_from_slice(SCOUT_RESULT_MAGIC);
     output.push(seed_length);
     output.extend_from_slice(seed.as_bytes());
-    output.extend_from_slice(&world.ring_gems.ordinals());
     encode_quest_summary(world.quests, &mut output)?;
     output.extend_from_slice(&count.to_be_bytes());
 
@@ -287,7 +527,8 @@ fn decode_quest_summary(input: &mut Input<'_>) -> Result<QuestSummary, WireError
             }
             IMP_QUEST_WIRE_ID => {
                 let variant = match variant {
-                    1 => ImpQuestType::Vault,
+                    1 => ImpTarget::Monk,
+                    2 => ImpTarget::Golem,
                     _ => return Err(WireError::UnknownQuestVariant),
                 };
                 quests.imp = Some(ScheduledQuest { variant, depth });
@@ -303,13 +544,14 @@ const WANDMAKER_QUEST_WIRE_ID: u8 = 2;
 const BLACKSMITH_QUEST_WIRE_ID: u8 = 3;
 const IMP_QUEST_WIRE_ID: u8 = 4;
 
-const fn imp_target_wire_id(variant: ImpQuestType) -> u8 {
-    match variant {
-        ImpQuestType::Vault => 1,
+const fn imp_target_wire_id(target: ImpTarget) -> u8 {
+    match target {
+        ImpTarget::Monk => 1,
+        ImpTarget::Golem => 2,
     }
 }
 
-/// Canonical floors that can host each quest giver.
+/// Canonical floors that can host each quest giver in v3.3.8.
 const fn quest_depth_range(quest: u8) -> std::ops::RangeInclusive<u8> {
     match quest {
         GHOST_QUEST_WIRE_ID => 2..=4,
@@ -321,7 +563,7 @@ const fn quest_depth_range(quest: u8) -> std::ops::RangeInclusive<u8> {
     }
 }
 
-/// Decodes an `SSC3` scouting response.
+/// Decodes an `SSC2` scouting response.
 ///
 /// This is primarily the executable protocol specification and makes native
 /// round-trip tests cover every source/accessibility branch. Android uses the
@@ -337,12 +579,6 @@ pub fn decode_scout_world(packet: &[u8]) -> Result<GeneratedWorld, WireError> {
         return Err(WireError::BadMagic);
     }
     let seed = DungeonSeed::from_code(input.utf8_u8()?).map_err(|_| WireError::InvalidSeedCode)?;
-    let ring_gems = input
-        .take(RING_GEM_COUNT)?
-        .try_into()
-        .ok()
-        .and_then(RingGems::from_ordinals)
-        .ok_or(WireError::InvalidRingGems)?;
     let quests = decode_quest_summary(&mut input)?;
     let count = usize::from(input.u16()?);
     let mut items = Vec::with_capacity(count);
@@ -408,7 +644,6 @@ pub fn decode_scout_world(packet: &[u8]) -> Result<GeneratedWorld, WireError> {
         seed,
         items,
         quests,
-        ring_gems,
     })
 }
 
@@ -438,7 +673,6 @@ const fn source_wire_id(source: ItemSource) -> u8 {
         ItemSource::WandmakerReward => 14,
         ItemSource::BlacksmithReward => 15,
         ItemSource::ImpReward => 16,
-        ItemSource::VaultTreasure => 17,
     }
 }
 
@@ -461,7 +695,6 @@ const fn source_from_wire_id(id: u8) -> Option<ItemSource> {
         14 => ItemSource::WandmakerReward,
         15 => ItemSource::BlacksmithReward,
         16 => ItemSource::ImpReward,
-        17 => ItemSource::VaultTreasure,
         _ => return None,
     })
 }
@@ -495,6 +728,11 @@ impl<'a> Input<'a> {
         Ok(u16::from_be_bytes(bytes))
     }
 
+    fn u16_le(&mut self) -> Result<u16, WireError> {
+        let bytes: [u8; 2] = self.take(2)?.try_into().map_err(|_| WireError::Truncated)?;
+        Ok(u16::from_le_bytes(bytes))
+    }
+
     fn u64(&mut self) -> Result<u64, WireError> {
         let bytes: [u8; 8] = self.take(8)?.try_into().map_err(|_| WireError::Truncated)?;
         Ok(u64::from_be_bytes(bytes))
@@ -522,10 +760,13 @@ pub enum WireError {
     Truncated,
     InvalidUtf8,
     InvalidSeedCode,
-    /// A query request with more requirements than a bridge accepts.
     InvalidRequirementCount,
+    UnknownItemKind,
     UnknownItem,
     UnknownModifier,
+    InvalidUpgradeMode,
+    InvalidTierMode,
+    InvalidQuery,
     TrailingData,
     TooManyResults,
     TooManyWorldItems,
@@ -537,11 +778,12 @@ pub enum WireError {
     UnknownItemSource,
     InvalidAccessibility,
     InvalidQuestCount,
-    InvalidRingGems,
     InvalidQuestOrder,
     InvalidQuestDepth,
     UnknownQuest,
     UnknownQuestVariant,
+    InvalidEffectSet,
+    InvalidLevelSum,
     /// A JSON query document the query codec rejected, with its message.
     InvalidQueryDocument(String),
 }
@@ -553,9 +795,13 @@ impl fmt::Display for WireError {
             Self::Truncated => "packet ended before a declared field",
             Self::InvalidUtf8 => "packet contains invalid UTF-8",
             Self::InvalidSeedCode => "seed code must contain nine A-Z characters",
-            Self::InvalidRequirementCount => "a query may carry at most 64 requirements",
+            Self::InvalidRequirementCount => "requirement count must be 1..=64",
+            Self::UnknownItemKind => "packet names an unknown item category",
             Self::UnknownItem => "packet names an unknown item ID",
             Self::UnknownModifier => "packet names an unknown enchantment or glyph",
+            Self::InvalidUpgradeMode => "packet contains an invalid upgrade predicate",
+            Self::InvalidTierMode => "packet contains an invalid tier predicate",
+            Self::InvalidQuery => "packet describes an inconsistent search query",
             Self::TrailingData => "packet has trailing bytes",
             Self::TooManyResults => "result batch exceeds the protocol limit",
             Self::TooManyWorldItems => "scouted world exceeds the protocol item limit",
@@ -563,17 +809,16 @@ impl fmt::Display for WireError {
             Self::InvalidFlags => "packet contains unknown flag bits",
             Self::InvalidChallenges => "packet challenge mask must be in 0..=511",
             Self::InvalidItemDepth => "scouted item depth must be in 1..=24",
-            Self::InvalidItemUpgrade => {
-                "scouted item upgrade exceeds its kind's ceiling (+5 weapons, +4 otherwise)"
-            }
+            Self::InvalidItemUpgrade => "scouted item upgrade must be in 0..=3",
             Self::UnknownItemSource => "packet names an unknown item source",
             Self::InvalidAccessibility => "packet contains an invalid accessibility constraint",
             Self::InvalidQuestCount => "scouted world lists more than four quests",
-            Self::InvalidRingGems => "packet ring gems are not a permutation of the twelve gems",
             Self::InvalidQuestOrder => "packet quest entries must have ascending unique IDs",
             Self::InvalidQuestDepth => "packet quest depth leaves its canonical floor range",
             Self::UnknownQuest => "packet names an unknown quest",
             Self::UnknownQuestVariant => "packet names an unknown quest variant",
+            Self::InvalidEffectSet => "packet contains an invalid effect list",
+            Self::InvalidLevelSum => "packet contains an invalid combined level group",
             Self::InvalidQueryDocument(message) => message,
         };
         formatter.write_str(message)
@@ -586,7 +831,6 @@ impl std::error::Error for WireError {}
 mod tests {
     use crate::catalog::{ArmorEffect, Effect, ITEMS, ItemId, ItemKind, WeaponEffect, item};
     use crate::challenges::Challenges;
-    use crate::json_query;
     use crate::main_world::CanonicalMainWorldGenerator;
     use crate::model::{Accessibility, GeneratedWorld, ItemSource, WorldItem};
     use crate::query::{
@@ -594,20 +838,15 @@ mod tests {
         UpgradeRequirement,
     };
     use crate::quests::WandmakerQuestType;
-    use crate::run::RingGems;
-
-    /// Every `SSC3` packet opens with the magic, the length-prefixed seed
-    /// code, and the run's twelve-byte gem table. The quest block starts here.
-    const SCOUT_HEADER: usize = 4 + 1 + 11 + super::RING_GEM_COUNT;
     use crate::search::WorldGenerator;
     use crate::seed::DungeonSeed;
 
     use super::{
         WireError, decode_query, decode_scout_request, decode_scout_seed, decode_scout_world,
-        empty_results, encode_results, encode_scout_world,
+        empty_results, encode_query, encode_results, encode_scout_world,
     };
 
-    const SOURCES: [ItemSource; 18] = [
+    const SOURCES: [ItemSource; 17] = [
         ItemSource::Heap,
         ItemSource::Chest,
         ItemSource::LockedChest,
@@ -625,25 +864,39 @@ mod tests {
         ItemSource::WandmakerReward,
         ItemSource::BlacksmithReward,
         ItemSource::ImpReward,
-        ItemSource::VaultTreasure,
     ];
 
-    /// The request bytes a frontend sends for a query: its canonical JSON
-    /// document.
-    fn request(query: &SearchQuery) -> Vec<u8> {
-        json_query::encode(query).to_string().into_bytes()
+    fn field(output: &mut Vec<u8>, value: &str) {
+        output.extend_from_slice(&u16::try_from(value.len()).unwrap().to_be_bytes());
+        output.extend_from_slice(value.as_bytes());
     }
 
-    /// The codec message a request was rejected with.
-    fn rejection(packet: &[u8]) -> String {
-        match decode_query(packet) {
-            Err(WireError::InvalidQueryDocument(message)) => message,
-            other => panic!("expected a document error, got {other:?}"),
-        }
+    fn query_packet(
+        flags: u8,
+        challenges: u16,
+        kind: u8,
+        stable_id: &str,
+        tier: [u8; 2],
+        upgrade: [u8; 2],
+    ) -> Vec<u8> {
+        let mut packet = b"SSF9".to_vec();
+        packet.push(24);
+        packet.push(flags);
+        packet.extend_from_slice(&challenges.to_le_bytes());
+        packet.push(0);
+        packet.extend_from_slice(&1_u16.to_be_bytes());
+        packet.push(kind);
+        field(&mut packet, stable_id);
+        packet.extend_from_slice(&tier);
+        packet.extend_from_slice(&upgrade);
+        // Wildcard effect, any source, no identity group, no floor limit, no
+        // alternative group, no combined-level group, no flags.
+        packet.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]);
+        packet
     }
 
     #[test]
-    fn query_requests_round_trip_every_query_field() {
+    fn ssf9_round_trips_all_query_fields() {
         let query = SearchQuery {
             requirements: vec![
                 Requirement {
@@ -694,46 +947,52 @@ mod tests {
             require_blacksmith: true,
             exclude_blacksmith_rewards: true,
             wandmaker_quest: Some(WandmakerQuestType::ElementalEmbers),
+            fast_mode: true,
         };
-        let packet = request(&query);
-        assert_eq!(packet[0], b'{');
+
+        let packet = encode_query(&query).unwrap();
+        assert_eq!(&packet[..4], b"SSF9");
+        // magic[4], max_depth, flags, challenges:u16le, then the quest byte.
+        assert_eq!(packet[8], WandmakerQuestType::ElementalEmbers.wire_id());
         assert_eq!(decode_query(&packet), Ok(query));
     }
 
     #[test]
-    fn query_requests_name_melee_and_thrown_kinds() {
+    fn ssf9_kind_bytes_cover_melee_and_thrown_and_stay_backwards_compatible() {
         use crate::catalog::WeaponCategory;
 
-        // A plain weapon kind matches melee and thrown weapons alike.
-        let plain = decode_query(br#"{"requirements":[{"kind":"weapon"}]}"#).unwrap();
-        assert_eq!(plain.requirements[0].kind, ItemKind::Weapon);
-        assert_eq!(plain.requirements[0].weapon_category, None);
+        // A legacy packet with kind byte 0 still decodes to an unfiltered
+        // weapon requirement that matches melee and thrown weapons alike.
+        let legacy = query_packet(0, 0, 0, "", [0, 0], [0, 0]);
+        let decoded = decode_query(&legacy).unwrap();
+        assert_eq!(decoded.requirements[0].kind, ItemKind::Weapon);
+        assert_eq!(decoded.requirements[0].weapon_category, None);
 
-        for (name, category) in [
-            ("melee_weapon", WeaponCategory::Melee),
-            ("thrown_weapon", WeaponCategory::Thrown),
-        ] {
-            let packet = format!(r#"{{"requirements":[{{"kind":"{name}"}}]}}"#);
-            let decoded = decode_query(packet.as_bytes()).unwrap();
+        // Kind bytes 4 and 5 carry the melee/thrown filters.
+        for (byte, category) in [(4, WeaponCategory::Melee), (5, WeaponCategory::Thrown)] {
+            let packet = query_packet(0, 0, byte, "", [0, 0], [0, 0]);
+            let decoded = decode_query(&packet).unwrap();
             assert_eq!(decoded.requirements[0].kind, ItemKind::Weapon);
             assert_eq!(decoded.requirements[0].weapon_category, Some(category));
-            assert_eq!(decode_query(&request(&decoded)), Ok(decoded));
+            let encoded = encode_query(&decoded).unwrap();
+            assert_eq!(encoded[11], byte);
+            assert_eq!(decode_query(&encoded), Ok(decoded));
         }
 
         // A thrown filter accepts a matching pinned item and rejects others.
-        let consistent =
-            decode_query(br#"{"requirements":[{"kind":"thrown_weapon","item":"shuriken"}]}"#)
-                .unwrap();
-        assert_eq!(consistent.requirements[0].item, Some(ItemId::Shuriken));
-        assert!(
-            rejection(br#"{"requirements":[{"kind":"thrown_weapon","item":"sword"}]}"#)
-                .contains("melee/thrown filters require")
+        let consistent = query_packet(0, 0, 5, "shuriken", [0, 0], [0, 0]);
+        assert_eq!(
+            decode_query(&consistent).unwrap().requirements[0].item,
+            Some(ItemId::Shuriken)
         );
-        assert!(rejection(br#"{"requirements":[{"kind":"potion"}]}"#).contains("potion"));
+        let inconsistent = query_packet(0, 0, 5, "sword", [0, 0], [0, 0]);
+        assert_eq!(decode_query(&inconsistent), Err(WireError::InvalidQuery));
+        let unknown = query_packet(0, 0, 6, "", [0, 0], [0, 0]);
+        assert_eq!(decode_query(&unknown), Err(WireError::UnknownItemKind));
     }
 
     #[test]
-    fn query_requests_round_trip_effect_sets_alternatives_and_level_sums() {
+    fn ssf9_round_trips_effect_sets_alternatives_and_level_sums() {
         let query = SearchQuery {
             requirements: vec![
                 Requirement {
@@ -746,7 +1005,7 @@ mod tests {
                         EffectSet::from_effects([
                             Effect::Weapon(WeaponEffect::Blocking),
                             Effect::Weapon(WeaponEffect::Projecting),
-                            Effect::Weapon(WeaponEffect::Wondrous),
+                            Effect::Weapon(WeaponEffect::Vampiric),
                         ])
                         .unwrap(),
                     ),
@@ -754,7 +1013,7 @@ mod tests {
                     source: None,
                     identity_group: None,
                     max_depth: None,
-                    alternative_group: Some(1),
+                    alternative_group: Some(3),
                     level_sum: None,
                 },
                 Requirement {
@@ -770,7 +1029,7 @@ mod tests {
                     source: None,
                     identity_group: None,
                     max_depth: None,
-                    alternative_group: Some(1),
+                    alternative_group: Some(3),
                     level_sum: None,
                 },
                 Requirement {
@@ -813,74 +1072,80 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         };
-        assert_eq!(decode_query(&request(&query)), Ok(query));
+        let packet = encode_query(&query).unwrap();
+        assert_eq!(decode_query(&packet), Ok(query));
     }
 
     #[test]
-    fn query_requests_reject_malformed_effect_lists_and_sum_groups() {
+    fn ssf9_rejects_malformed_effect_lists_and_sum_groups() {
+        // An effect mode other than 0/1 is invalid.
+        let mut packet = query_packet(0, 0, 0, "sword", [0, 0], [0, 0]);
+        let effect_mode = packet.len() - 8;
+        packet[effect_mode] = 2;
+        assert_eq!(decode_query(&packet), Err(WireError::InvalidEffectSet));
+
         // A one-of list must not be empty.
-        assert!(
-            rejection(br#"{"requirements":[{"item":"sword","effect":[]}]}"#)
-                .contains("at least one entry")
-        );
+        let mut packet = query_packet(0, 0, 0, "sword", [0, 0], [0, 0]);
+        packet[effect_mode] = 1;
+        packet.insert(effect_mode + 1, 0);
+        assert_eq!(decode_query(&packet), Err(WireError::InvalidEffectSet));
+
         // A list naming an effect of another family is unknown.
-        assert!(
-            rejection(br#"{"requirements":[{"item":"sword","effect":["Thorns"]}]}"#)
-                .contains("Thorns")
-        );
+        let mut packet = query_packet(0, 0, 0, "sword", [0, 0], [0, 0]);
+        packet[effect_mode] = 1;
+        packet.insert(effect_mode + 1, 1);
+        let mut name = Vec::new();
+        field(&mut name, "Thorns");
+        packet.splice(effect_mode + 2..effect_mode + 2, name);
+        assert_eq!(decode_query(&packet), Err(WireError::UnknownModifier));
+
         // A combined-level total without a group is malformed.
-        assert!(
-            rejection(
-                br#"{"requirements":[{"item":"sword","level_sum":{"group":0,"at_least":3}}]}"#
-            )
-            .contains("group")
-        );
+        let mut packet = query_packet(0, 0, 0, "sword", [0, 0], [0, 0]);
+        let sum_total = packet.len() - 2;
+        packet[sum_total] = 3;
+        assert_eq!(decode_query(&packet), Err(WireError::InvalidLevelSum));
+
         // A sum group whose total is unattainable fails query validation.
-        assert!(
-            rejection(
-                br#"{"requirements":[{"item":"ring_might","level_sum":{"group":1,"at_least":9}}]}"#
-            )
-            .contains("level")
-        );
-        // Levels combine across rings only.
-        assert!(
-            rejection(
-                br#"{"requirements":[{"item":"sword","level_sum":{"group":1,"at_least":3}}]}"#
-            )
-            .contains("rings")
-        );
+        let mut packet = query_packet(0, 0, 0, "sword", [0, 0], [0, 0]);
+        packet[sum_total - 1] = 1;
+        packet[sum_total] = 9;
+        assert_eq!(decode_query(&packet), Err(WireError::InvalidQuery));
     }
 
     #[test]
-    fn query_requests_are_canonical_json_documents() {
+    fn query_requests_may_be_canonical_json_documents() {
         let document = br#"{"requirements":[
             {"any_of":[{"item":"spear","upgrade":3},{"item":"sword","upgrade":1}]},
             {"kind":"armor","effect":"any_enchantment"}
-        ],"max_depth":12}"#;
+        ],"max_depth":12,"fast_mode":true}"#;
         let query = decode_query(document).unwrap();
         assert_eq!(query.max_depth, 12);
+        assert!(query.fast_mode);
         assert_eq!(query.slot_count(), 2);
         assert_eq!(query.requirements.len(), 3);
-        // The canonical re-encoding of the same query decodes identically,
-        // and so does the document behind a byte-order mark or leading
-        // whitespace.
-        assert_eq!(decode_query(&request(&query)), Ok(query.clone()));
+        // The binary form of the same query decodes identically, and so does
+        // the document behind a byte-order mark or leading whitespace.
+        assert_eq!(
+            decode_query(&encode_query(&query).unwrap()),
+            Ok(query.clone())
+        );
         let mut with_bom = b"\xEF\xBB\xBF\n  ".to_vec();
         with_bom.extend_from_slice(document);
         assert_eq!(decode_query(&with_bom), Ok(query));
 
         // Documents the query codec rejects — malformed JSON, unknown fields
-        // or an invalid query — are all invalid requests, and so is anything
-        // that is not a document at all: the retired binary form included.
-        assert!(rejection(b"{").contains("invalid JSON"));
-        assert!(rejection(b"").contains("invalid JSON"));
-        assert!(rejection(b"SSF9\x18\0\0\0\0\0\x01").contains("invalid JSON"));
-        assert!(rejection(b"bad!????????").contains("invalid JSON"));
-        assert!(rejection(br#"{"requirements":[],"maximum_depth":4}"#).contains("maximum_depth"));
-        assert!(rejection(br#"{"requirements":[]}"#).contains("at least one item requirement"));
+        // or an invalid query — are all invalid requests.
+        let message = |packet: &[u8]| match decode_query(packet) {
+            Err(WireError::InvalidQueryDocument(message)) => message,
+            other => panic!("expected a document error, got {other:?}"),
+        };
+        assert!(message(b"{").contains("invalid JSON"));
+        assert!(message(br#"{"requirements":[],"maximum_depth":4}"#).contains("maximum_depth"));
+        assert!(message(br#"{"requirements":[]}"#).contains("at least one item requirement"));
         assert!(
-            rejection(br#"{"requirements":[{"kind":"weapon","upgarde":2}]}"#).contains("upgarde")
+            message(br#"{"requirements":[{"kind":"weapon","upgarde":2}]}"#).contains("upgarde")
         );
         let too_many = format!(
             r#"{{"requirements":[{}]}}"#,
@@ -891,95 +1156,55 @@ mod tests {
             Err(WireError::InvalidRequirementCount)
         );
         assert_eq!(decode_query(b"{\xff"), Err(WireError::InvalidUtf8));
-        assert_eq!(decode_query(&[0xff]), Err(WireError::InvalidUtf8));
     }
 
     #[test]
-    fn query_requests_carry_the_uncursed_requirement_flag() {
-        let cursed_allowed = decode_query(br#"{"requirements":[{"item":"sword"}]}"#).unwrap();
-        assert!(!cursed_allowed.requirements[0].require_uncursed);
-        let uncursed =
-            decode_query(br#"{"requirements":[{"item":"sword","uncursed":true}]}"#).unwrap();
-        assert!(uncursed.requirements[0].require_uncursed);
-        // The flag is a boolean; serde names the expected type.
-        assert!(
-            rejection(br#"{"requirements":[{"item":"sword","uncursed":2}]}"#).contains("boolean")
-        );
+    fn ssf9_decodes_uncursed_requirement_flag() {
+        let mut packet = query_packet(0, 0, 0, "sword", [0, 0], [1, 2]);
+        *packet.last_mut().unwrap() = 1;
+        assert!(decode_query(&packet).unwrap().requirements[0].require_uncursed);
+
+        *packet.last_mut().unwrap() = 2;
+        assert_eq!(decode_query(&packet), Err(WireError::InvalidFlags));
     }
 
     #[test]
-    fn query_requests_select_one_wandmaker_variant_or_none() {
-        // An absent filter is "any", which is what every request carries
-        // until a user picks a quest, so it must stay the neutral value.
-        let any = decode_query(br#"{"requirements":[{"item":"sword"}]}"#).unwrap();
-        assert_eq!(any.wandmaker_quest, None);
+    fn ssf9_quest_byte_selects_one_wandmaker_variant_or_none() {
+        // Zero is "any", which is what every packet carries until a user
+        // picks a quest, so it must stay the neutral value.
+        let any = query_packet(0, 0, 0, "sword", [0, 0], [0, 0]);
+        assert_eq!(decode_query(&any).unwrap().wandmaker_quest, None);
 
         for variant in WandmakerQuestType::ALL {
-            let query = SearchQuery {
-                wandmaker_quest: Some(variant),
-                ..any.clone()
-            };
-            let packet = request(&query);
-            assert!(
-                std::str::from_utf8(&packet)
-                    .unwrap()
-                    .contains(variant.document_name())
-            );
+            let mut packet = any.clone();
+            packet[8] = variant.wire_id();
             assert_eq!(
                 decode_query(&packet).unwrap().wandmaker_quest,
                 Some(variant)
             );
+            assert_eq!(
+                encode_query(&decode_query(&packet).unwrap()).unwrap(),
+                packet
+            );
         }
 
-        assert!(
-            rejection(br#"{"requirements":[{"item":"sword"}],"wandmaker_quest":"imp"}"#)
-                .contains("imp")
-        );
+        let unknown = {
+            let mut packet = any;
+            packet[8] = 4;
+            packet
+        };
+        assert_eq!(decode_query(&unknown), Err(WireError::UnknownQuestVariant));
     }
 
     #[test]
-    fn query_requests_honor_the_per_kind_upgrade_ceilings() {
-        let upgrade = |item: &str, upgrade: u8| {
-            let packet = format!(r#"{{"requirements":[{{"item":"{item}","upgrade":{upgrade}}}]}}"#);
-            decode_query(packet.as_bytes())
-        };
-        assert_eq!(
-            upgrade("ring_sharpshooting", 4).unwrap().requirements[0].upgrade,
-            UpgradeRequirement::Exact(4)
-        );
-        // Only the tier-4 weapons reach +5, melee and thrown alike.
-        assert_eq!(
-            upgrade("battle_axe", 5).unwrap().requirements[0].upgrade,
-            UpgradeRequirement::Exact(5)
-        );
-        assert_eq!(
-            upgrade("javelin", 5).unwrap().requirements[0].upgrade,
-            UpgradeRequirement::Exact(5)
-        );
-        assert_eq!(
-            upgrade("sword", 4).unwrap().requirements[0].upgrade,
-            UpgradeRequirement::Exact(4)
-        );
-        assert_eq!(
-            upgrade("plate_armor", 4).unwrap().requirements[0].upgrade,
-            UpgradeRequirement::Exact(4)
-        );
-        assert!(matches!(
-            upgrade("ring_sharpshooting", 5),
-            Err(WireError::InvalidQueryDocument(_))
-        ));
-        assert!(matches!(
-            upgrade("sword", 5),
-            Err(WireError::InvalidQueryDocument(_))
-        ));
-        assert!(matches!(
-            upgrade("shuriken", 5),
-            Err(WireError::InvalidQueryDocument(_))
-        ));
-        assert!(matches!(
-            upgrade("battle_axe", 6),
-            Err(WireError::InvalidQueryDocument(_))
-        ));
+    fn query_wire_accepts_plus_four_only_for_rings() {
+        let ring = query_packet(0, 0, 3, "ring_sharpshooting", [0, 0], [1, 4]);
+        let query = decode_query(&ring).unwrap();
+        assert_eq!(query.requirements[0].kind, ItemKind::Ring);
+        assert_eq!(query.requirements[0].upgrade, UpgradeRequirement::Exact(4));
+
+        let sword = query_packet(0, 0, 0, "sword", [0, 0], [1, 4]);
+        assert_eq!(decode_query(&sword), Err(WireError::InvalidQuery));
     }
 
     #[test]
@@ -989,13 +1214,11 @@ mod tests {
                 quests: crate::quests::QuestSummary::default(),
                 seed: DungeonSeed::MIN,
                 items: Vec::new(),
-                ring_gems: RingGems::UNSHUFFLED,
             },
             GeneratedWorld {
                 quests: crate::quests::QuestSummary::default(),
                 seed: DungeonSeed::new(1).unwrap(),
                 items: Vec::new(),
-                ring_gems: RingGems::UNSHUFFLED,
             },
         ];
         let packet = encode_results(&worlds).unwrap();
@@ -1068,14 +1291,9 @@ mod tests {
                 },
                 secret: false,
             }],
-            ring_gems: RingGems::UNSHUFFLED,
         };
         let packet = encode_scout_world(&world).unwrap();
-        let mut expected = b"SSC3\x0bAAA-AAA-AAA".to_vec();
-        // The run's own gem table, unshuffled here, so every ring class
-        // keeps the cell the catalog gives it.
-        expected.extend_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
-        expected.extend_from_slice(b"\0\0\x01\0\x0awand_frost");
+        let mut expected = b"SSC2\x0bAAA-AAA-AAA\0\0\x01\0\x0awand_frost".to_vec();
         expected.extend_from_slice(&[
             7, 2, 1, // depth, upgrade, cursed flag
             0, 0, // no effect
@@ -1089,7 +1307,7 @@ mod tests {
     #[test]
     fn scout_packet_quest_block_has_a_fixed_big_endian_fixture() {
         use crate::quests::{
-            BlacksmithQuestType, GhostQuestType, ImpQuestType, QuestSummary, ScheduledQuest,
+            BlacksmithQuestType, GhostQuestType, ImpTarget, QuestSummary, ScheduledQuest,
             WandmakerQuestType,
         };
 
@@ -1108,25 +1326,21 @@ mod tests {
                     depth: 13,
                 }),
                 imp: Some(ScheduledQuest {
-                    variant: ImpQuestType::Vault,
+                    variant: ImpTarget::Golem,
                     depth: 18,
                 }),
             },
             seed: DungeonSeed::MIN,
             items: Vec::new(),
-            ring_gems: RingGems::UNSHUFFLED,
         };
         let packet = encode_scout_world(&world).unwrap();
-        let mut expected = b"SSC3\x0bAAA-AAA-AAA".to_vec();
-        // The run's own gem table, unshuffled here, so every ring class
-        // keeps the cell the catalog gives it.
-        expected.extend_from_slice(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        let mut expected = b"SSC2\x0bAAA-AAA-AAA".to_vec();
         expected.extend_from_slice(&[
             4, // quest count
             1, 3, 4, // ghost: great crab on floor 4
             2, 3, 8, // wandmaker: rotberry on floor 8
             3, 1, 13, // blacksmith: crystal on floor 13
-            4, 1, 18, // imp: vault on floor 18
+            4, 2, 18, // imp: golem on floor 18
             0, 0, // item count
         ]);
         assert_eq!(packet, expected);
@@ -1147,41 +1361,39 @@ mod tests {
             },
             seed: DungeonSeed::MIN,
             items: Vec::new(),
-            ring_gems: RingGems::UNSHUFFLED,
         };
         let packet = encode_scout_world(&world).unwrap();
-        // The quest count and its one entry (quest, variant, depth), then
-        // the empty item count.
-        assert_eq!(&packet[SCOUT_HEADER..], &[1, 2, 1, 7, 0, 0]);
+        // Header (16), then quest count and one entry (quest, variant, depth).
+        assert_eq!(&packet[16..], &[1, 2, 1, 7, 0, 0]);
 
         let mut bad_count = packet.clone();
-        bad_count[SCOUT_HEADER] = 5;
+        bad_count[16] = 5;
         assert_eq!(
             decode_scout_world(&bad_count),
             Err(WireError::InvalidQuestCount)
         );
 
         let mut bad_quest = packet.clone();
-        bad_quest[SCOUT_HEADER + 1] = 9;
+        bad_quest[17] = 9;
         assert_eq!(decode_scout_world(&bad_quest), Err(WireError::UnknownQuest));
 
         let mut bad_variant = packet.clone();
-        bad_variant[SCOUT_HEADER + 2] = 4;
+        bad_variant[18] = 4;
         assert_eq!(
             decode_scout_world(&bad_variant),
             Err(WireError::UnknownQuestVariant)
         );
 
         let mut bad_depth = packet.clone();
-        bad_depth[SCOUT_HEADER + 3] = 12;
+        bad_depth[19] = 12;
         assert_eq!(
             decode_scout_world(&bad_depth),
             Err(WireError::InvalidQuestDepth)
         );
 
         let mut duplicated = packet;
-        duplicated[SCOUT_HEADER] = 2;
-        let entry_start = SCOUT_HEADER + 1;
+        duplicated[16] = 2;
+        let entry_start = 17;
         let entry = duplicated[entry_start..entry_start + 3].to_vec();
         duplicated.splice(entry_start + 3..entry_start + 3, entry);
         assert_eq!(
@@ -1215,7 +1427,6 @@ mod tests {
                 accessibility: Accessibility::Independent,
                 secret: true,
             }],
-            ring_gems: RingGems::UNSHUFFLED,
         };
         let packet = encode_scout_world(&world).unwrap();
         assert_eq!(decode_scout_world(&packet), Ok(world));
@@ -1266,18 +1477,17 @@ mod tests {
                     depth: 2,
                 }),
                 imp: Some(crate::quests::ScheduledQuest {
-                    variant: crate::quests::ImpQuestType::Vault,
+                    variant: crate::quests::ImpTarget::Monk,
                     depth: 17,
                 }),
                 ..crate::quests::QuestSummary::default()
             },
             seed: DungeonSeed::MAX,
             items,
-            ring_gems: RingGems::UNSHUFFLED,
         };
 
         let packet = encode_scout_world(&world).unwrap();
-        assert_eq!(&packet[..4], b"SSC3");
+        assert_eq!(&packet[..4], b"SSC2");
         assert_eq!(decode_scout_world(&packet), Ok(world));
     }
 
@@ -1285,20 +1495,18 @@ mod tests {
     #[allow(clippy::too_many_lines)] // One golden packet: quests, then every official item.
     fn canonical_aaa_scout_response_contains_all_official_depth_twenty_four_items() {
         use crate::quests::{
-            BlacksmithQuestType, GhostQuestType, ImpQuestType, QuestSummary, ScheduledQuest,
+            BlacksmithQuestType, GhostQuestType, ImpTarget, QuestSummary, ScheduledQuest,
             WandmakerQuestType,
         };
 
-        // Re-pinned from the v4.0.0-BETA-3 oracle (tooling/oracle-4.0): the
-        // vault adds fifteen treasure options to the Imp's five prizes.
         let generated = CanonicalMainWorldGenerator.generate(DungeonSeed::MIN, 24);
-        assert_eq!(generated.items.len(), 94);
+        assert_eq!(generated.items.len(), 67);
         assert_eq!(
             generated.quests,
             QuestSummary {
                 ghost: Some(ScheduledQuest {
-                    variant: GhostQuestType::GnollTrickster,
-                    depth: 3,
+                    variant: GhostQuestType::GreatCrab,
+                    depth: 4,
                 }),
                 wandmaker: Some(ScheduledQuest {
                     variant: WandmakerQuestType::ElementalEmbers,
@@ -1309,7 +1517,7 @@ mod tests {
                     depth: 13,
                 }),
                 imp: Some(ScheduledQuest {
-                    variant: ImpQuestType::Vault,
+                    variant: ImpTarget::Golem,
                     depth: 19,
                 }),
             }
@@ -1320,7 +1528,7 @@ mod tests {
                 .iter()
                 .filter(|value| item(value.item).kind == ItemKind::Ring)
                 .count(),
-            8
+            5
         );
         let packet = encode_scout_world(&generated).unwrap();
         let decoded = decode_scout_world(&packet).unwrap();
@@ -1328,25 +1536,24 @@ mod tests {
 
         assert!(decoded.items.iter().any(|item| {
             item.depth == 1
-                && item.item == ItemId::ThrowingSpear
-                && item.upgrade == 2
+                && item.item == ItemId::ScaleArmor
+                && item.upgrade == 0
                 && item.source == ItemSource::Chest
         }));
-        assert_eq!(decoded.items.iter().filter(|item| item.secret).count(), 5);
+        assert_eq!(decoded.items.iter().filter(|item| item.secret).count(), 4);
         assert!(decoded.items.iter().any(|item| {
             item.depth == 2
-                && item.item == ItemId::Kunai
-                && item.upgrade == 0
+                && item.item == ItemId::LeatherArmor
+                && item.upgrade == 1
                 && item.source == ItemSource::LockedChest
                 && item.secret
         }));
-        // A v4.0.0 curse travels through the packet by its wire name.
         assert!(decoded.items.iter().any(|item| {
             item.depth == 7
-                && item.item == ItemId::Scimitar
+                && item.item == ItemId::ThrowingSpear
                 && item.upgrade == 1
                 && item.cursed
-                && item.effect == Some(Effect::Weapon(WeaponEffect::Wondrous))
+                && item.effect == Some(Effect::Weapon(WeaponEffect::Polarized))
         }));
 
         let blacksmith = decoded
@@ -1359,69 +1566,40 @@ mod tests {
             item.upgrade == 2 && matches!(item.accessibility, Accessibility::Choice { .. })
         }));
 
-        let mut depth_twenty = decoded
+        let depth_twenty = decoded
             .items
             .iter()
             .filter(|item| item.depth == 20 && item.source == ItemSource::Shop)
             .map(|item| item.item)
             .collect::<Vec<_>>();
-        depth_twenty.sort_by_key(|item| *item as u8);
         assert_eq!(
             depth_twenty,
             vec![
-                ItemId::WarHammer,
-                ItemId::ThrowingHammer,
                 ItemId::PlateArmor,
+                ItemId::ThrowingHammer,
+                ItemId::Greatshield,
                 ItemId::IncendiaryDart,
             ]
         );
-        // A v4.0.0 enchantment on an animated statue's weapon.
         assert!(decoded.items.iter().any(|item| {
             item.depth == 22
-                && item.item == ItemId::Greatsword
-                && item.source == ItemSource::Statue
-                && item.effect == Some(Effect::Weapon(WeaponEffect::Venomous))
+                && item.item == ItemId::PlateArmor
+                && item.upgrade == 2
+                && item.effect == Some(Effect::Armor(ArmorEffect::Swiftness))
         }));
         assert!(decoded.items.iter().any(|item| {
             item.depth == 24
-                && item.item == ItemId::AssassinsBlade
-                && item.upgrade == 2
+                && item.item == ItemId::RunicBlade
                 && item.cursed
-                && item.source == ItemSource::SacrificialFire
-                && item.effect == Some(Effect::Weapon(WeaponEffect::Polarized))
+                && item.effect == Some(Effect::Weapon(WeaponEffect::Displacing))
         }));
-        // The Imp's prizes and the vault's treasure share one single-pick group.
-        let imp_ring = decoded
-            .items
-            .iter()
-            .find(|item| {
-                item.depth == 19
-                    && item.item == ItemId::RingHaste
-                    && item.upgrade == 2
-                    && !item.cursed
-                    && item.source == ItemSource::ImpReward
-            })
-            .expect("the Imp's ring prize");
-        let vault_axe = decoded
-            .items
-            .iter()
-            .find(|item| {
-                item.depth == 19
-                    && item.item == ItemId::BattleAxe
-                    && item.upgrade == 4
-                    && item.source == ItemSource::VaultTreasure
-                    && item.effect == Some(Effect::Weapon(WeaponEffect::Blooming))
-            })
-            .expect("the vault's +4 battle axe");
-        let group = |accessibility: Accessibility| match accessibility {
-            Accessibility::Choice { group, .. } => group,
-            other => panic!("expected a choice, got {other:?}"),
-        };
-        assert_eq!(
-            group(imp_ring.accessibility),
-            group(vault_axe.accessibility)
-        );
-        assert_ne!(imp_ring.accessibility, vault_axe.accessibility);
+        assert!(decoded.items.iter().any(|item| {
+            item.depth == 19
+                && item.item == ItemId::RingHaste
+                && item.upgrade == 3
+                && item.cursed
+                && item.source == ItemSource::ImpReward
+        }));
     }
 
     #[test]
@@ -1429,7 +1607,7 @@ mod tests {
         let world = GeneratedWorld {
             quests: crate::quests::QuestSummary {
                 imp: Some(crate::quests::ScheduledQuest {
-                    variant: crate::quests::ImpQuestType::Vault,
+                    variant: crate::quests::ImpTarget::Golem,
                     depth: 19,
                 }),
                 ..crate::quests::QuestSummary::default()
@@ -1448,7 +1626,6 @@ mod tests {
                 },
                 secret: true,
             }],
-            ring_gems: RingGems::UNSHUFFLED,
         };
         let packet = encode_scout_world(&world).unwrap();
         for end in 0..packet.len() {
@@ -1475,40 +1652,38 @@ mod tests {
                 accessibility: Accessibility::Independent,
                 secret: false,
             }],
-            ring_gems: RingGems::UNSHUFFLED,
         };
         let packet = encode_scout_world(&world).unwrap();
 
         let mut bad_flags = packet.clone();
-        // Past the header: the empty quest block, the item count, the
-        // length-prefixed "wand_frost", then depth and upgrade.
-        bad_flags[SCOUT_HEADER + 17] = 4;
+        // Header (19, incl. empty quest block), ID length (2), "wand_frost"
+        // (10), depth, upgrade.
+        bad_flags[33] = 4;
         assert_eq!(decode_scout_world(&bad_flags), Err(WireError::InvalidFlags));
 
         let mut bad_depth = packet.clone();
-        bad_depth[SCOUT_HEADER + 15] = 0;
+        bad_depth[31] = 0;
         assert_eq!(
             decode_scout_world(&bad_depth),
             Err(WireError::InvalidItemDepth)
         );
 
-        // Wands reach +4 in v4.0.0; +5 is above every kind's ceiling.
         let mut bad_upgrade = packet.clone();
-        bad_upgrade[SCOUT_HEADER + 16] = 5;
+        bad_upgrade[32] = 4;
         assert_eq!(
             decode_scout_world(&bad_upgrade),
             Err(WireError::InvalidItemUpgrade)
         );
 
         let mut bad_source = packet.clone();
-        bad_source[SCOUT_HEADER + 20] = u8::MAX;
+        bad_source[36] = u8::MAX;
         assert_eq!(
             decode_scout_world(&bad_source),
             Err(WireError::UnknownItemSource)
         );
 
         let mut bad_accessibility = packet.clone();
-        bad_accessibility[SCOUT_HEADER + 21] = u8::MAX;
+        bad_accessibility[37] = u8::MAX;
         assert_eq!(
             decode_scout_world(&bad_accessibility),
             Err(WireError::InvalidAccessibility)
@@ -1570,7 +1745,6 @@ mod tests {
             quests: crate::quests::QuestSummary::default(),
             seed: DungeonSeed::MIN,
             items: vec![item; usize::from(u16::MAX) + 1],
-            ring_gems: RingGems::UNSHUFFLED,
         };
         assert_eq!(
             encode_scout_world(&world),

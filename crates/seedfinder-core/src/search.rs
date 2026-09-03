@@ -35,13 +35,6 @@ pub trait FloorGate: Sync {
         items_so_far: &[WorldItem],
         quests_so_far: &QuestSummary,
     ) -> bool;
-
-    /// Whether the Imp's Vault sub-level must be generated. Its treasure is
-    /// only ever matched by requirements the vault can satisfy, so a gate
-    /// that knows none exist lets the generator skip the extra level.
-    fn wants_vault_treasure(&self) -> bool {
-        true
-    }
 }
 
 /// Version-pinned world simulator used by the parallel search scheduler.
@@ -832,7 +825,6 @@ mod tests {
     use crate::catalog::{ItemId, ItemKind};
     use crate::model::{Accessibility, GeneratedWorld, ItemSource, WorldItem};
     use crate::query::{EffectRequirement, Requirement, SearchQuery, TierRequirement};
-    use crate::run::RingGems;
 
     use super::{
         SearchError, SearchOptions, SearchProgress, StreamingSearchState, WorldGenerator,
@@ -862,7 +854,6 @@ mod tests {
                 quests: crate::quests::QuestSummary::default(),
                 seed,
                 items,
-                ring_gems: RingGems::UNSHUFFLED,
             }
         }
     }
@@ -889,6 +880,7 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         };
         let options = SearchOptions {
             start_seed: 0,
@@ -948,7 +940,6 @@ mod tests {
                             })
                             .into_iter()
                             .collect(),
-                        ring_gems: RingGems::UNSHUFFLED,
                     })
                     .collect()
             }
@@ -974,6 +965,7 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         };
         let options = SearchOptions {
             start_seed: 0,
@@ -1019,7 +1011,6 @@ mod tests {
                     quests: crate::quests::QuestSummary::default(),
                     seed,
                     items: Vec::new(),
-                    ring_gems: RingGems::UNSHUFFLED,
                 }
             }
         }
@@ -1044,6 +1035,7 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         };
         let options = SearchOptions {
             start_seed: 10,
@@ -1116,6 +1108,7 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         };
         let options = SearchOptions {
             start_seed: 0,
@@ -1156,6 +1149,7 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         }
     }
 
@@ -1181,7 +1175,6 @@ mod tests {
                 seed,
                 items,
                 quests: crate::quests::QuestSummary::default(),
-                ring_gems: RingGems::UNSHUFFLED,
             }
         }
     }
@@ -1207,7 +1200,6 @@ mod tests {
                     seed,
                     items: Vec::new(),
                     quests: crate::quests::QuestSummary::default(),
-                    ring_gems: RingGems::UNSHUFFLED,
                 }
             }
         }
@@ -1298,6 +1290,7 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         };
         let options = SearchOptions {
             start_seed: 0,
@@ -1483,7 +1476,6 @@ mod tests {
                         accessibility: Accessibility::Independent,
                     }],
                     quests: crate::quests::QuestSummary::default(),
-                    ring_gems: RingGems::UNSHUFFLED,
                 }
             }
         }
@@ -1523,7 +1515,6 @@ mod tests {
                     quests: crate::quests::QuestSummary::default(),
                     seed,
                     items: Vec::new(),
-                    ring_gems: RingGems::UNSHUFFLED,
                 }
             }
         }
@@ -1548,6 +1539,7 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         };
         let options = SearchOptions {
             start_seed: 0,
