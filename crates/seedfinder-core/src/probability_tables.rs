@@ -11,7 +11,7 @@
 //! This module owns the shape of that data; the generated file owns the
 //! values.
 
-use crate::catalog::{EXTRA_UPGRADE_MAXIMUM, ItemId, ItemKind};
+use crate::catalog::{ItemId, ItemKind};
 use crate::generator::{
     MISSILE_TIER_1_ITEMS, MISSILE_TIER_2_ITEMS, MISSILE_TIER_3_ITEMS, MISSILE_TIER_4_ITEMS,
     MISSILE_TIER_5_ITEMS, MissileKind,
@@ -110,12 +110,13 @@ pub const HIGHEST_TIER: u8 = 5;
 
 const _: () = assert!(TIERS == HIGHEST_TIER as usize);
 
-/// Highest upgrade level with its own tabled probability. It is the highest
-/// the generator rolls, so no bucket has to absorb the levels above it.
-pub const HIGHEST_TABLED_UPGRADE: u8 = EXTRA_UPGRADE_MAXIMUM;
+/// Highest upgrade level with its own tabled probability.
+pub const MAX_TABLED_UPGRADE: usize = 4;
 
-/// [`HIGHEST_TABLED_UPGRADE`] as a table width.
-pub const MAX_TABLED_UPGRADE: usize = HIGHEST_TABLED_UPGRADE as usize;
+/// [`MAX_TABLED_UPGRADE`] as an upgrade level.
+pub const HIGHEST_TABLED_UPGRADE: u8 = 4;
+
+const _: () = assert!(MAX_TABLED_UPGRADE == HIGHEST_TABLED_UPGRADE as usize);
 
 /// Highest number of same-identity duplicates the repeat table covers.
 pub const IDENTITY_REPEAT_LIMIT: usize = 4;
@@ -141,7 +142,7 @@ pub struct Supply {
     pub shared_roll: bool,
     /// Expected number of reward slots on each floor `1..=24`.
     pub depth_slots: [f32; DEPTHS],
-    /// Probability of each upgrade level `+0..=+5`.
+    /// Probability of each upgrade level `+0..=+4`.
     pub upgrades: [f32; MAX_TABLED_UPGRADE + 1],
     /// Probability the item is cursed.
     pub cursed: f32,
@@ -149,37 +150,6 @@ pub struct Supply {
     pub enchanted: f32,
     /// Probability of each tier per floor set, zero for untiered families.
     pub tiers: [[f32; TIERS]; FLOOR_SETS],
-    /// Upgrade shares per tier, for the sources that settle both at once, or
-    /// `None` where a tier and a level are rolled apart and [`Supply::tiers`]
-    /// and [`Supply::upgrades`] can simply be multiplied.
-    ///
-    /// See [`locks_levels_to_tiers`]. Which tiers a source reaches varies by
-    /// depth, but the lock itself does not, so this is conditioned on tier
-    /// alone: read `levels[tier - 1][upgrade]` as the share of that tier's
-    /// items carrying that level.
-    pub levels: Option<&'static TierLevels>,
-}
-
-/// The upgrade level an item of each tier carries, for a source that fixes the
-/// two together.
-pub type TierLevels = [[f32; MAX_TABLED_UPGRADE + 1]; TIERS];
-
-/// Whether a source settles an item's tier and its upgrade level with one
-/// draw rather than two.
-///
-/// Both of the Imp's hoards do. Its vault stocks four fixed shelves and hands
-/// items off them one at a time, so which shelf an item came from fixes both
-/// numbers: the tier-4 armor is always the third shelf's, and always `+2`. Its
-/// own reward flips a coin between a tier-5 melee at `+2..=+4` beside a tier-4
-/// thrown at `+3..=+5`, and the same pair with the lines swapped — so whichever
-/// weapon is tier 4 is the one levelled furthest.
-///
-/// Scoring a tier and a level apart at either invents items neither ever
-/// hands out: a `+3` armor below tier 5, or a `+5` tier-5 weapon. Every other
-/// source does draw the two apart, and the marginals describe those exactly.
-#[must_use]
-pub const fn locks_levels_to_tiers(source: ItemSource) -> bool {
-    matches!(source, ItemSource::VaultTreasure | ItemSource::ImpReward)
 }
 
 /// Every source that can hold searchable equipment, in table order.
@@ -203,7 +173,6 @@ pub const fn sources() -> &'static [ItemSource] {
         ItemSource::WandmakerReward,
         ItemSource::BlacksmithReward,
         ItemSource::ImpReward,
-        ItemSource::VaultTreasure,
     ]
 }
 
@@ -228,7 +197,6 @@ pub const fn source_index(source: ItemSource) -> usize {
         ItemSource::WandmakerReward => 14,
         ItemSource::BlacksmithReward => 15,
         ItemSource::ImpReward => 16,
-        ItemSource::VaultTreasure => 17,
     }
 }
 
@@ -277,72 +245,36 @@ pub const fn kind_index(kind: ItemKind) -> usize {
 /// rather than as scattered drops, so their floor slot counts are the bundle
 /// size times the probability that the quest or shop landed on that floor.
 /// Sources that scatter independent drops return `0` and are treated as
-/// Poisson, which is the one thing this still decides for a quest: only a
-/// shop's bundle scales anything, since [`prize_group`] sources are lifted
-/// out of the per-family supply and spent as one pick each.
-///
-/// The Imp's City-floor prizes are a fixed six: a tier-5 weapon with a
-/// tier-4 thrown weapon or the reverse (two weapon slots, one per line), the
-/// plate armor, the wand, and one ring slot for the ring beside the
-/// artifact-or-ring option. The vault's treasure rooms vary; their counts are
-/// what a typical vault places, rounded up: about eight weapons and thrown
-/// weapons, three to four armors, and two to three wands and rings.
+/// Poisson.
 #[must_use]
 pub const fn bundle_size(source: ItemSource, kind: ItemKind) -> u8 {
     match (source, kind) {
-        (ItemSource::VaultTreasure, ItemKind::Weapon) => 8,
-        (ItemSource::VaultTreasure, ItemKind::Armor) => 4,
-        (ItemSource::Shop, ItemKind::Weapon)
-        | (ItemSource::VaultTreasure, ItemKind::Wand | ItemKind::Ring) => 3,
-        (ItemSource::ImpReward, ItemKind::Weapon) => 2,
+        (ItemSource::Shop, ItemKind::Weapon) => 3,
         (ItemSource::BlacksmithReward, ItemKind::Weapon)
         | (ItemSource::WandmakerReward, ItemKind::Wand)
         | (ItemSource::GhostReward, ItemKind::Weapon | ItemKind::Armor)
         | (ItemSource::BlacksmithReward | ItemSource::Shop, ItemKind::Armor)
         | (ItemSource::Shop, ItemKind::Wand | ItemKind::Ring)
-        | (ItemSource::ImpReward, ItemKind::Armor | ItemKind::Wand | ItemKind::Ring) => 1,
+        | (ItemSource::ImpReward, ItemKind::Ring) => 1,
         _ => 0,
     }
 }
 
-/// The quest whose single prize a source belongs to.
+/// Whether a source places all of its items on a single floor of a window.
 ///
-/// A quest giver lays its prizes out as one mutually exclusive choice and the
-/// player carries exactly one away, whatever family it belongs to: the Ghost
-/// offers a weapon or an armor, the Wandmaker two wands, the Blacksmith a
-/// reforge or one of its rack. The Imp's rewards and its vault's treasure
-/// share a group because the Escape Crystal lets one item out between them.
-///
-/// This is the same rule [`crate::feasibility`] plans against, and it spans
-/// families, so the estimator has to resolve every family at once to honour
-/// it — see [`crate::probability`].
+/// Quests run once per dungeon, so their per-floor counts are alternatives:
+/// a Ghost that appeared on floor two cannot also appear on floor three. Shops
+/// restock on every shop floor and are therefore not exclusive.
 #[must_use]
-pub const fn prize_group(source: ItemSource) -> Option<PrizeGroup> {
-    match source {
-        ItemSource::GhostReward => Some(PrizeGroup::Ghost),
-        ItemSource::WandmakerReward => Some(PrizeGroup::Wandmaker),
-        ItemSource::BlacksmithReward => Some(PrizeGroup::Blacksmith),
-        ItemSource::ImpReward | ItemSource::VaultTreasure => Some(PrizeGroup::Imp),
-        _ => None,
-    }
+pub const fn appears_once(source: ItemSource) -> bool {
+    matches!(
+        source,
+        ItemSource::GhostReward
+            | ItemSource::WandmakerReward
+            | ItemSource::BlacksmithReward
+            | ItemSource::ImpReward
+    )
 }
-
-/// A quest's prize pool: everything it lays out, of which one item leaves.
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-pub enum PrizeGroup {
-    Ghost,
-    Wandmaker,
-    Blacksmith,
-    Imp,
-}
-
-/// Every prize group, in table order.
-pub const PRIZE_GROUPS: [PrizeGroup; 4] = [
-    PrizeGroup::Ghost,
-    PrizeGroup::Wandmaker,
-    PrizeGroup::Blacksmith,
-    PrizeGroup::Imp,
-];
 
 /// Row of [`SLOT_SPREAD`] covering one family's line.
 #[must_use]

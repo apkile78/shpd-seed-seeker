@@ -40,18 +40,15 @@ const ARMOR_CURSES: [ArmorEffect; 8] = [
     ArmorEffect::Bulk,
 ];
 
-/// `Weapon.Enchantment.curses` in v4.0.0 declaration order.
-const WEAPON_CURSES: [WeaponEffect; 10] = [
+const WEAPON_CURSES: [WeaponEffect; 8] = [
     WeaponEffect::Annoying,
     WeaponEffect::Displacing,
     WeaponEffect::Dazzling,
     WeaponEffect::Explosive,
-    WeaponEffect::Friendly,
-    WeaponEffect::Polarized,
-    WeaponEffect::Pressurized,
     WeaponEffect::Sacrificial,
     WeaponEffect::Wayward,
-    WeaponEffect::Wondrous,
+    WeaponEffect::Polarized,
+    WeaponEffect::Friendly,
 ];
 
 /// Directly constructed items which are not represented by `Generator`.
@@ -2388,7 +2385,7 @@ mod tests {
             SpecialRoomKind::Statue => vec![world_item(
                 ItemId::Crossbow,
                 1,
-                Some(Effect::Weapon(WeaponEffect::Blocking)),
+                Some(Effect::Weapon(WeaponEffect::Lucky)),
                 false,
                 ItemSource::Statue,
                 Accessibility::Independent,
@@ -2418,7 +2415,7 @@ mod tests {
             SpecialRoomKind::Sacrifice => vec![world_item(
                 ItemId::Greatshield,
                 1,
-                Some(Effect::Weapon(WeaponEffect::Polarized)),
+                Some(Effect::Weapon(WeaponEffect::Wayward)),
                 true,
                 ItemSource::SacrificialFire,
                 Accessibility::Independent,
@@ -2565,7 +2562,7 @@ mod tests {
                 world_item(
                     ItemId::Crossbow,
                     0,
-                    Some(Effect::Weapon(WeaponEffect::Corrupting)),
+                    Some(Effect::Weapon(WeaponEffect::Grim)),
                     false,
                     ItemSource::ArmoredStatue,
                     Accessibility::Independent,
@@ -2617,7 +2614,7 @@ mod tests {
             world_item(
                 ItemId::Sai,
                 0,
-                Some(Effect::Weapon(WeaponEffect::Wondrous)),
+                Some(Effect::Weapon(WeaponEffect::Explosive)),
                 true,
                 ItemSource::Heap,
                 Accessibility::Independent,

@@ -253,17 +253,13 @@ pub fn create_sewer_mobs<R: RoomCharacterRules>(
         }
     }
 
-    // Java iterates the complete Level.mobs set here, not just mobs created by
-    // this loop. This therefore includes room-painted mobs and the Ghost.
-    for (cell, &is_occupied) in occupied.iter().enumerate() {
-        if is_occupied
-            && matches!(
-                level.map.cells[cell],
-                terrain::HIGH_GRASS | terrain::FURROWED_GRASS
-            )
-        {
-            level.map.cells[cell] = terrain::GRASS;
-            flags.los_blocking[cell] = false;
+    for mob in &placed {
+        if matches!(
+            level.map.cells[mob.cell],
+            terrain::HIGH_GRASS | terrain::FURROWED_GRASS
+        ) {
+            level.map.cells[mob.cell] = terrain::GRASS;
+            flags.los_blocking[mob.cell] = false;
         }
     }
 

@@ -4,8 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use crate::catalog::{
-    ALL_ARMOR_EFFECTS, ALL_WEAPON_EFFECTS, EXTRA_UPGRADE_TIER, Effect, ItemId, ItemKind,
-    MAX_GENERATED_UPGRADE, MAX_STANDARD_RING_UPGRADE, WeaponCategory, item,
+    ALL_ARMOR_EFFECTS, ALL_WEAPON_EFFECTS, Effect, ItemId, ItemKind, WeaponCategory, item,
 };
 use crate::challenges::Challenges;
 use crate::model::{GeneratedWorld, ItemSource, WorldItem};
@@ -297,9 +296,6 @@ impl EffectRequirement {
 /// levels. Members are *optional*: one +2 ring alone satisfies a two-member
 /// group asking for three levels. Combine with [`Requirement::identity_group`]
 /// to demand the contributing items be copies of one kind.
-///
-/// Only ring requirements may carry one: a ring's effect scales with its
-/// level, so levels on separate rings add up the way no other family's do.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LevelSum {
     /// Non-zero group label shared by the participating requirements.
@@ -362,41 +358,22 @@ impl Requirement {
         .then_some(identity)
     }
 
-    /// The highest upgrade an item of the kind, identity and tier this
-    /// requirement asks for can carry, whatever its upgrade filter says.
-    ///
-    /// Only a tier-[`EXTRA_UPGRADE_TIER`] weapon is levelled past
-    /// [`MAX_GENERATED_UPGRADE`], so a requirement that rules that tier out —
-    /// by naming an item of another tier, or by filtering the tier away —
-    /// stops there.
-    #[must_use]
-    pub fn upgrade_ceiling(self) -> u8 {
-        let reaches_the_extra_tier = match self.item {
-            Some(item_id) => item(item_id).tier == Some(EXTRA_UPGRADE_TIER),
-            None => self.tier.matches(Some(EXTRA_UPGRADE_TIER)),
-        };
-        if reaches_the_extra_tier {
-            self.kind
-                .maximum_search_upgrade_for_tier(EXTRA_UPGRADE_TIER)
-        } else {
-            MAX_GENERATED_UPGRADE
-        }
-    }
-
     /// The highest upgrade level an item satisfying this requirement can
     /// carry.
     #[must_use]
-    pub fn maximum_upgrade(self) -> u8 {
+    pub const fn maximum_upgrade(self) -> u8 {
         match self.upgrade {
             UpgradeRequirement::Exact(wanted) => wanted,
-            UpgradeRequirement::Any | UpgradeRequirement::AtLeast(_) => self.upgrade_ceiling(),
+            UpgradeRequirement::Any | UpgradeRequirement::AtLeast(_) => {
+                self.kind.maximum_search_upgrade()
+            }
         }
     }
 
     /// The most *levels* — upgrade plus one — an item satisfying this
     /// requirement can contribute to a combined-level group.
     #[must_use]
-    pub fn maximum_level(self) -> u8 {
+    pub const fn maximum_level(self) -> u8 {
         self.maximum_upgrade() + 1
     }
 
@@ -490,7 +467,7 @@ impl Requirement {
         if !valid_tier {
             return Err(QueryError::InvalidTier);
         }
-        let maximum = self.upgrade_ceiling();
+        let maximum = self.kind.maximum_search_upgrade();
         let valid_upgrade = match self.upgrade {
             UpgradeRequirement::Any => true,
             UpgradeRequirement::Exact(upgrade) => (1..=maximum).contains(&upgrade),
@@ -510,12 +487,6 @@ impl Requirement {
             .is_some_and(|sum| sum.group == RESERVED_GROUP || sum.minimum_total == 0)
         {
             return Err(QueryError::InvalidLevelSum);
-        }
-        // Levels only combine meaningfully across rings — a ring's effect
-        // scales with its level, so a +0 and a +1 together grant what one
-        // +2 does. No other family adds up that way.
-        if self.level_sum.is_some() && self.kind != ItemKind::Ring {
-            return Err(QueryError::LevelSumOutsideRings);
         }
         if self.alternative_group.is_some() && self.level_sum.is_some() {
             return Err(QueryError::LevelSumInsideAlternative);
@@ -559,6 +530,12 @@ pub struct SearchQuery {
     /// is worth searching for on its own; the other three givers' variants
     /// change nothing but the fight, and are reported rather than filtered.
     pub wandmaker_quest: Option<WandmakerQuestType>,
+    /// Trades exhaustiveness for speed: +3 weapon/armor requirements are
+    /// assumed to come from quest rewards, ignoring the far rarer Crypt and
+    /// Sacrificial-fire prizes. Matches are still always genuine, but seeds
+    /// whose only qualifying item comes from those rooms are skipped. See
+    /// [`crate::feasibility`].
+    pub fast_mode: bool,
 }
 
 /// Whether `candidate`'s Wandmaker filter is at least as strict as `base`'s.
@@ -652,12 +629,11 @@ impl SearchQuery {
             }
         }
         for (group, summary) in self.level_sum_groups() {
-            let attainable = summary.attainable_capacity();
-            if summary.minimum_total > attainable {
+            if summary.minimum_total > summary.capacity {
                 return Err(QueryError::UnattainableLevelSum {
                     group,
                     minimum_total: summary.minimum_total,
-                    capacity: attainable,
+                    capacity: summary.capacity,
                 });
             }
         }
@@ -729,8 +705,8 @@ impl SearchQuery {
         slots.len() - sum_slots + groups.len()
     }
 
-    /// Whether this query *continues* `base`: identical floor limit and
-    /// challenges, world conditions at least as strict as
+    /// Whether this query *continues* `base`: identical floor limit,
+    /// challenges and fast mode, world conditions at least as strict as
     /// `base`'s (the blacksmith flags and the Wandmaker filter — see
     /// [`flag_at_least_as_strict`]), and, for every slot of `base`, a
     /// *distinct* slot of this query at least as strict: each of its members
@@ -755,6 +731,7 @@ impl SearchQuery {
                 base.exclude_blacksmith_rewards,
             )
             || !quest_at_least_as_strict(self.wandmaker_quest, base.wandmaker_quest)
+            || self.fast_mode != base.fast_mode
         {
             return false;
         }
@@ -957,24 +934,6 @@ pub struct SumGroup {
     /// The most combined levels the members could contribute together:
     /// each one's [`Requirement::maximum_level`].
     pub capacity: u16,
-}
-
-impl SumGroup {
-    /// The most combined levels a generated world can actually put on the
-    /// group: [`SumGroup::capacity`] bounded by generation, which levels at
-    /// most one ring — the Imp vault's prize — beyond
-    /// [`MAX_STANDARD_RING_UPGRADE`]. The matcher keeps pruning against the
-    /// per-member `capacity`, which stays sound on any world it is handed;
-    /// this tighter bound is what validation holds a total to.
-    #[must_use]
-    pub fn attainable_capacity(&self) -> u16 {
-        let generated = u16::from(MAX_GENERATED_UPGRADE + 1)
-            + self
-                .members
-                .saturating_sub(1)
-                .saturating_mul(u16::from(MAX_STANDARD_RING_UPGRADE + 1));
-        self.capacity.min(generated)
-    }
 }
 
 /// Letter every editor shows for a portable group label (A..D), falling
@@ -1421,8 +1380,6 @@ pub enum QueryError {
     OverconstrainedIdentityGroup,
     InvalidAlternativeGroup,
     InvalidLevelSum,
-    /// A combined-level group member of a family other than rings.
-    LevelSumOutsideRings,
     /// The members of the group disagree on the total.
     InconsistentLevelSum {
         group: u8,
@@ -1463,9 +1420,7 @@ impl fmt::Display for QueryError {
         let message = match self {
             Self::Empty => "at least one item requirement is needed",
             Self::InvalidDepth => "maximum depth must be between 1 and 24",
-            Self::InvalidUpgrade => {
-                "upgrade must be between +1 and +4; only a tier-4 weapon, melee or thrown, reaches +5"
-            }
+            Self::InvalidUpgrade => "upgrade must be +1, +2, or +3 (+4 for rings)",
             Self::InvalidTier => {
                 "tier filters require a wildcard weapon or armor and a non-redundant tier"
             }
@@ -1485,7 +1440,6 @@ impl fmt::Display for QueryError {
             }
             Self::InvalidAlternativeGroup => "alternative group zero is reserved for no group",
             Self::InvalidLevelSum => "combined level groups need a non-zero group and total",
-            Self::LevelSumOutsideRings => "levels are only counted together across rings",
             Self::InconsistentLevelSum { .. } | Self::UnattainableLevelSum { .. } => {
                 unreachable!("written above")
             }
@@ -1501,9 +1455,8 @@ impl std::error::Error for QueryError {}
 
 #[cfg(test)]
 mod tests {
-    use crate::catalog::{Effect, ItemId, ItemKind, WeaponCategory, WeaponEffect};
+    use crate::catalog::{Effect, ItemId, ItemKind, WeaponEffect};
     use crate::model::{Accessibility, GeneratedWorld, ItemSource, WorldItem};
-    use crate::run::RingGems;
     use crate::seed::DungeonSeed;
 
     use super::{
@@ -1550,6 +1503,7 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         };
 
         // Equality and supersets continue, in any requirement order.
@@ -1567,14 +1521,17 @@ mod tests {
         assert!(base.continues(&single));
         assert!(!single.continues(&base));
 
-        // A different world — floor limit or challenges — breaks continuation
-        // outright.
+        // A different world — floor limit, challenges, or the lossy fast
+        // mode — breaks continuation outright.
         let mut deeper = base.clone();
         deeper.max_depth = 5;
         assert!(!deeper.continues(&base));
         let mut challenged = base.clone();
         challenged.challenges = crate::challenges::Challenges::DARKNESS;
         assert!(!challenged.continues(&base));
+        let mut fast = base.clone();
+        fast.fast_mode = true;
+        assert!(!fast.continues(&base));
 
         // The world conditions only ever remove seeds, so switching one on
         // strengthens the query rather than ending the continuation. Turning
@@ -1637,6 +1594,7 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         };
         let base = query(vec![any_ring]);
 
@@ -1713,6 +1671,7 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         };
         let any_ring = query(ItemKind::Ring, None);
         let tenacity = query(ItemKind::Ring, Some(ItemId::RingTenacity));
@@ -1739,6 +1698,7 @@ mod tests {
         // Scope differences are irrelevant: a filter re-verifies from scratch.
         let mut deep_ring = any_ring.clone();
         deep_ring.max_depth = 5;
+        deep_ring.fast_mode = true;
         assert!(deep_ring.shares_item(&tenacity));
     }
 
@@ -1751,12 +1711,12 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         };
         let one = GeneratedWorld {
             quests: crate::quests::QuestSummary::default(),
             seed: DungeonSeed::MIN,
             items: vec![world_item(ItemId::Sword, Accessibility::Independent)],
-            ring_gems: RingGems::UNSHUFFLED,
         };
         assert!(!query.matches(&one));
         let two = GeneratedWorld {
@@ -1766,7 +1726,6 @@ mod tests {
                 world_item(ItemId::Sword, Accessibility::Independent),
                 world_item(ItemId::Sword, Accessibility::Independent),
             ],
-            ring_gems: RingGems::UNSHUFFLED,
         };
         assert!(query.matches(&two));
     }
@@ -1782,6 +1741,7 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: Some(WandmakerQuestType::Rotberry),
+            fast_mode: false,
         };
         let world = |wandmaker| GeneratedWorld {
             quests: QuestSummary {
@@ -1790,7 +1750,6 @@ mod tests {
             },
             seed: DungeonSeed::MIN,
             items: vec![world_item(ItemId::Sword, Accessibility::Independent)],
-            ring_gems: RingGems::UNSHUFFLED,
         };
         let rotberry = ScheduledQuest {
             variant: WandmakerQuestType::Rotberry,
@@ -1836,7 +1795,6 @@ mod tests {
             quests: crate::quests::QuestSummary::default(),
             seed: DungeonSeed::MIN,
             items: vec![world_item(ItemId::Sword, Accessibility::Independent)],
-            ring_gems: RingGems::UNSHUFFLED,
         };
         let mut limited = requirement(ItemId::Sword);
         limited.max_depth = Some(2);
@@ -1847,6 +1805,7 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         };
         assert!(!query.matches(&world));
         query.requirements[0].max_depth = Some(3);
@@ -1862,6 +1821,7 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         };
         let world = GeneratedWorld {
             quests: crate::quests::QuestSummary::default(),
@@ -1882,7 +1842,6 @@ mod tests {
                     },
                 ),
             ],
-            ring_gems: RingGems::UNSHUFFLED,
         };
         assert!(!query.matches(&world));
     }
@@ -1896,6 +1855,7 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         };
         let world = GeneratedWorld {
             quests: crate::quests::QuestSummary::default(),
@@ -1916,7 +1876,6 @@ mod tests {
                     },
                 ),
             ],
-            ring_gems: RingGems::UNSHUFFLED,
         };
         assert!(query.matches(&world));
     }
@@ -1948,7 +1907,6 @@ mod tests {
             quests: crate::quests::QuestSummary::default(),
             seed: DungeonSeed::MIN,
             items: vec![sword, armor, wand],
-            ring_gems: RingGems::UNSHUFFLED,
         };
 
         let compatible = SearchQuery {
@@ -1958,6 +1916,7 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         };
         assert!(compatible.matches(&world));
 
@@ -1968,6 +1927,7 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         };
         assert!(!incompatible.matches(&world));
     }
@@ -2086,7 +2046,7 @@ mod tests {
     }
 
     #[test]
-    fn upgrade_ceilings_follow_the_item_kind_and_tier() {
+    fn plus_four_is_valid_only_for_rings() {
         let ring = Requirement {
             kind: ItemKind::Ring,
             weapon_category: None,
@@ -2117,109 +2077,7 @@ mod tests {
             alternative_group: None,
             level_sum: None,
         };
-        assert_eq!(wand.validate(), Ok(()));
-        let five_wand = Requirement {
-            upgrade: UpgradeRequirement::Exact(5),
-            ..wand
-        };
-        assert_eq!(five_wand.validate(), Err(QueryError::InvalidUpgrade));
-
-        let armor = Requirement {
-            kind: ItemKind::Armor,
-            item: Some(ItemId::PlateArmor),
-            upgrade: UpgradeRequirement::Exact(5),
-            ..wand
-        };
-        assert_eq!(armor.validate(), Err(QueryError::InvalidUpgrade));
-    }
-
-    /// Only the tier-4 weapons are levelled past `+4`, melee and thrown
-    /// alike; every other tier stops one short.
-    #[test]
-    fn only_a_tier_four_weapon_reaches_the_top_upgrade() {
-        let wand = Requirement {
-            kind: ItemKind::Wand,
-            weapon_category: None,
-            item: Some(ItemId::WandFrost),
-            tier: TierRequirement::Any,
-            upgrade: UpgradeRequirement::Exact(4),
-            effect: EffectRequirement::Any,
-            require_uncursed: false,
-            source: None,
-            identity_group: None,
-            max_depth: None,
-            alternative_group: None,
-            level_sum: None,
-        };
-        let battle_axe = Requirement {
-            kind: ItemKind::Weapon,
-            item: Some(ItemId::BattleAxe),
-            upgrade: UpgradeRequirement::AtLeast(5),
-            ..wand
-        };
-        assert_eq!(battle_axe.validate(), Ok(()));
-        let six_battle_axe = Requirement {
-            upgrade: UpgradeRequirement::Exact(6),
-            ..battle_axe
-        };
-        assert_eq!(six_battle_axe.validate(), Err(QueryError::InvalidUpgrade));
-        let javelin = Requirement {
-            item: Some(ItemId::Javelin),
-            weapon_category: Some(WeaponCategory::Thrown),
-            upgrade: UpgradeRequirement::Exact(5),
-            ..battle_axe
-        };
-        assert_eq!(javelin.validate(), Ok(()));
-
-        let sword = Requirement {
-            item: Some(ItemId::Sword),
-            upgrade: UpgradeRequirement::Exact(5),
-            ..battle_axe
-        };
-        assert_eq!(sword.validate(), Err(QueryError::InvalidUpgrade));
-        assert_eq!(
-            Requirement {
-                upgrade: UpgradeRequirement::Exact(4),
-                ..sword
-            }
-            .validate(),
-            Ok(())
-        );
-        let trident = Requirement {
-            item: Some(ItemId::Trident),
-            ..sword
-        };
-        assert_eq!(trident.validate(), Err(QueryError::InvalidUpgrade));
-
-        // A wildcard weapon reaches +5 unless its tier filter rules tier 4 out.
-        let any_weapon = Requirement {
-            item: None,
-            upgrade: UpgradeRequirement::Exact(5),
-            ..battle_axe
-        };
-        assert_eq!(any_weapon.validate(), Ok(()));
-        for tier in [
-            TierRequirement::Exact(4),
-            TierRequirement::AtLeast(4),
-            TierRequirement::AtMost(4),
-        ] {
-            assert_eq!(
-                Requirement { tier, ..any_weapon }.validate(),
-                Ok(()),
-                "{tier:?}"
-            );
-        }
-        for tier in [
-            TierRequirement::Exact(5),
-            TierRequirement::Exact(2),
-            TierRequirement::AtMost(3),
-        ] {
-            assert_eq!(
-                Requirement { tier, ..any_weapon }.validate(),
-                Err(QueryError::InvalidUpgrade),
-                "{tier:?}"
-            );
-        }
+        assert_eq!(wand.validate(), Err(QueryError::InvalidUpgrade));
     }
 
     #[test]
@@ -2342,6 +2200,7 @@ mod tests {
             require_blacksmith: true,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         };
         let make = |item, upgrade, depth, source| WorldItem {
             item,
@@ -2363,7 +2222,6 @@ mod tests {
                 make(ItemId::WandLightning, 1, 5, ItemSource::Heap),
                 make(ItemId::Sword, 2, 13, ItemSource::BlacksmithReward),
             ],
-            ring_gems: RingGems::UNSHUFFLED,
         };
 
         assert_eq!(query.validate(), Ok(()));
@@ -2386,6 +2244,7 @@ mod tests {
             require_blacksmith: true,
             exclude_blacksmith_rewards: true,
             wandmaker_quest: None,
+            fast_mode: false,
         };
         let make = |source| WorldItem {
             item: ItemId::Sword,
@@ -2401,7 +2260,6 @@ mod tests {
             quests: crate::quests::QuestSummary::default(),
             seed: DungeonSeed::MIN,
             items: vec![make(ItemSource::BlacksmithReward)],
-            ring_gems: RingGems::UNSHUFFLED,
         };
 
         assert!(!query.matches(&smith_only));
@@ -2415,7 +2273,6 @@ mod tests {
             quests: crate::quests::QuestSummary::default(),
             seed: DungeonSeed::MIN,
             items: vec![make(ItemSource::Heap)],
-            ring_gems: RingGems::UNSHUFFLED,
         };
         assert!(query.matches(&no_blacksmith));
     }
@@ -2443,6 +2300,7 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         };
 
         // Two members naming items would describe two different wands forced
@@ -2758,6 +2616,22 @@ mod tests {
             ],
             ..scout_query(Vec::new())
         };
+        // A ring reaches +4, so it counts up to five levels; two rings ten.
+        assert_eq!(pair(3).validate(), Ok(()));
+        assert_eq!(pair(10).validate(), Ok(()));
+        assert_eq!(
+            pair(11).validate(),
+            Err(QueryError::UnattainableLevelSum {
+                group: 1,
+                minimum_total: 11,
+                capacity: 10,
+            })
+        );
+        assert_eq!(
+            pair(11).validate().unwrap_err().to_string(),
+            "combined level group A needs 11 levels but its items can reach at most 10"
+        );
+
         let rings = |upgrades: &[u8]| {
             scout_world(
                 upgrades
@@ -2792,55 +2666,6 @@ mod tests {
         let short = scout_matches(&rings(&[1]), &pair(4));
         assert_eq!(short.matched_requirements, 0);
         assert!(short.matched_indices().is_empty());
-    }
-
-    #[test]
-    fn combined_level_validation_caps_totals_and_admits_rings_only() {
-        let might = |level_sum| Requirement {
-            item: Some(ItemId::RingMight),
-            level_sum: Some(level_sum),
-            ..plain(ItemKind::Ring)
-        };
-        let pair = |minimum_total| SearchQuery {
-            requirements: vec![
-                might(LevelSum {
-                    group: 1,
-                    minimum_total,
-                });
-                2
-            ],
-            ..scout_query(Vec::new())
-        };
-        // A ring reaches +4 (five levels), but only one per world — the Imp
-        // vault's prize; every other ring stops at +2 (three levels). Two
-        // rings therefore reach eight levels together, not ten.
-        assert_eq!(pair(3).validate(), Ok(()));
-        assert_eq!(pair(8).validate(), Ok(()));
-        assert_eq!(
-            pair(9).validate(),
-            Err(QueryError::UnattainableLevelSum {
-                group: 1,
-                minimum_total: 9,
-                capacity: 8,
-            })
-        );
-        assert_eq!(
-            pair(9).validate().unwrap_err().to_string(),
-            "combined level group A needs 9 levels but its items can reach at most 8"
-        );
-        // Only rings count levels together.
-        assert_eq!(
-            Requirement {
-                item: Some(ItemId::Sword),
-                level_sum: Some(LevelSum {
-                    group: 1,
-                    minimum_total: 3,
-                }),
-                ..plain(ItemKind::Weapon)
-            }
-            .validate(),
-            Err(QueryError::LevelSumOutsideRings)
-        );
 
         // Members agree on the total, sums need a group and a total, and a
         // sum cannot live inside an alternative group.
@@ -2984,6 +2809,7 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
+            fast_mode: false,
         }
     }
 
@@ -2992,7 +2818,6 @@ mod tests {
             quests: crate::quests::QuestSummary::default(),
             seed: DungeonSeed::MIN,
             items,
-            ring_gems: RingGems::UNSHUFFLED,
         }
     }
 

@@ -1080,11 +1080,8 @@ fn random_artifact_or_ring(
     if let Some(artifact) = random_artifact(random, generator)? {
         Ok(GeneratedItem::Artifact(artifact))
     } else {
-        // v4.0.0: an exhausted artifact deck falls back to
-        // `randomUsingDefaults(RING)`, which draws the identity from the outer
-        // stream and leaves the ring deck untouched.
-        let index = select_default_identity_index(random, GeneratorCategory::Ring)?;
-        randomize_identity(random, GeneratorCategory::Ring, index, false)
+        let index = select_seeded_identity_index(random, generator, GeneratorCategory::Ring)?;
+        randomize_identity(random, GeneratorCategory::Ring, index, true)
     }
 }
 
@@ -1537,7 +1534,7 @@ mod tests {
                 ItemId::Sword,
                 1,
                 true,
-                Some(Effect::Weapon(WeaponEffect::Annoying))
+                Some(Effect::Weapon(WeaponEffect::Sacrificial))
             )
         );
         assert_eq!(
@@ -1562,7 +1559,7 @@ mod tests {
                 ItemId::Crossbow,
                 0,
                 true,
-                Some(Effect::Weapon(WeaponEffect::Dazzling))
+                Some(Effect::Weapon(WeaponEffect::Annoying))
             )
         );
     }
@@ -1576,7 +1573,7 @@ mod tests {
                     ItemId::Quarterstaff,
                     0,
                     true,
-                    Some(Effect::Weapon(WeaponEffect::Annoying)),
+                    Some(Effect::Weapon(WeaponEffect::Sacrificial)),
                 ),
             ),
             (
@@ -1618,7 +1615,7 @@ mod tests {
                 ItemId::Mace,
                 0,
                 true,
-                Some(Effect::Weapon(WeaponEffect::Annoying))
+                Some(Effect::Weapon(WeaponEffect::Sacrificial))
             ))
         );
         assert_eq!(
@@ -1684,7 +1681,7 @@ mod tests {
                 quantity: 3,
                 roll: EquipmentRoll {
                     upgrade: 1,
-                    effect: Some(Effect::Weapon(WeaponEffect::Polarized)),
+                    effect: Some(Effect::Weapon(WeaponEffect::Wayward)),
                     cursed: true
                 }
             }
@@ -1887,9 +1884,9 @@ mod tests {
             )
             .unwrap(),
             GeneratedItem::Ring(GeneratedRing {
-                kind: RingKind::Accuracy,
+                kind: RingKind::Wealth,
                 roll: EquipmentRoll {
-                    upgrade: 2,
+                    upgrade: 0,
                     effect: None,
                     cursed: true
                 }
@@ -1904,18 +1901,17 @@ mod tests {
             )
             .unwrap(),
             GeneratedItem::Ring(GeneratedRing {
-                kind: RingKind::Tenacity,
+                kind: RingKind::Accuracy,
                 roll: EquipmentRoll {
-                    upgrade: 0,
+                    upgrade: 2,
                     effect: None,
                     cursed: false
                 }
             })
         );
-        assert_eq!(random.long(), -3_969_803_455_732_910_376);
+        assert_eq!(random.long(), -3_901_995_299_017_043_590);
         assert_eq!(generator.category(GeneratorCategory::Artifact).dropped, 13);
-        // v4.0.0 falls back to randomUsingDefaults(RING): the ring deck is untouched.
-        assert_eq!(generator.category(GeneratorCategory::Ring).dropped, 0);
+        assert_eq!(generator.category(GeneratorCategory::Ring).dropped, 2);
     }
 
     #[test]

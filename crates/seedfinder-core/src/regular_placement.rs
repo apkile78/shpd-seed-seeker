@@ -91,8 +91,6 @@ impl RoomPlacementRules for CanonicalRoomPlacementRules {
                 }
             }
             RoomKind::Quest(QuestRoomKind::AmbitiousImp) => false,
-            // v4.0.0 BlacksmithRoom only accepts its plain-floor ring.
-            RoomKind::Quest(QuestRoomKind::Blacksmith) => level.map.cells[cell] == terrain::EMPTY,
             RoomKind::Quest(QuestRoomKind::RitualSite) => self
                 .ritual_cells
                 .iter()
@@ -101,7 +99,9 @@ impl RoomPlacementRules for CanonicalRoomPlacementRules {
             RoomKind::Connection(_)
             | RoomKind::Special(_)
             | RoomKind::Secret(_)
-            | RoomKind::Quest(QuestRoomKind::MassGrave | QuestRoomKind::RotGarden) => true,
+            | RoomKind::Quest(
+                QuestRoomKind::MassGrave | QuestRoomKind::RotGarden | QuestRoomKind::Blacksmith,
+            ) => true,
         }
     }
 
