@@ -24,8 +24,10 @@ struct QueryDocument {
     exclude_blacksmith_rewards: bool,
     #[serde(default)]
     wandmaker_quest: Option<String>,
-    #[serde(default)]
-    fast_mode: bool,
+    /// Accepted so documents saved before fast mode was retired still load;
+    /// the value is ignored and never written back.
+    #[serde(default, rename = "fast_mode")]
+    _fast_mode: bool,
     #[serde(default)]
     challenges: Vec<FileChallenge>,
 }
@@ -241,6 +243,7 @@ enum FileItemSource {
     WandmakerReward,
     BlacksmithReward,
     ImpReward,
+    VaultTreasure,
 }
 
 impl From<FileItemSource> for ItemSource {
@@ -263,6 +266,7 @@ impl From<FileItemSource> for ItemSource {
             FileItemSource::WandmakerReward => Self::WandmakerReward,
             FileItemSource::BlacksmithReward => Self::BlacksmithReward,
             FileItemSource::ImpReward => Self::ImpReward,
+            FileItemSource::VaultTreasure => Self::VaultTreasure,
         }
     }
 }
@@ -362,7 +366,6 @@ pub fn decode_unvalidated(contents: &str) -> Result<SearchQuery, String> {
         require_blacksmith: document.require_blacksmith,
         exclude_blacksmith_rewards: document.exclude_blacksmith_rewards,
         wandmaker_quest,
-        fast_mode: document.fast_mode,
     })
 }
 
@@ -495,6 +498,7 @@ pub const fn source_name(source: ItemSource) -> &'static str {
         ItemSource::WandmakerReward => "wandmaker_reward",
         ItemSource::BlacksmithReward => "blacksmith_reward",
         ItemSource::ImpReward => "imp_reward",
+        ItemSource::VaultTreasure => "vault_treasure",
     }
 }
 
@@ -535,9 +539,6 @@ pub fn encode(query: &SearchQuery) -> Value {
     if let Some(variant) = query.wandmaker_quest {
         document.insert("wandmaker_quest".to_owned(), json!(variant.document_name()));
     }
-    if query.fast_mode {
-        document.insert("fast_mode".to_owned(), json!(true));
-    }
     let challenges = CHALLENGE_NAMES
         .iter()
         .filter(|(_, challenge)| query.challenges.contains(*challenge))
@@ -549,14 +550,12 @@ pub fn encode(query: &SearchQuery) -> Value {
     Value::Object(document)
 }
 
-/// The order effect lists are written in: the shared catalog asset's —
-/// enchantments (glyphs) alphabetically, then curses alphabetically — which
+/// The order effect lists are written in: the shared catalog asset's — the
+/// game journal's, enchantments (glyphs) by rarity, then the curses — which
 /// every frontend already holds, so documents stay byte-identical across
-/// platforms without any of them learning the engine's upstream ordering.
+/// platforms. [`EffectSet::effects`] already iterates in that order.
 fn document_effect_order(set: EffectSet) -> Vec<Effect> {
-    let mut effects: Vec<Effect> = set.effects().collect();
-    effects.sort_by_key(|effect| (effect.is_curse(), effect.wire_name().to_ascii_lowercase()));
-    effects
+    set.effects().collect()
 }
 
 fn encode_requirement(requirement: &Requirement) -> Value {
@@ -811,6 +810,8 @@ mod tests {
 
     #[test]
     fn parse_only_decoding_keeps_editor_state_without_requirements() {
+        // `fast_mode` is a retired flag kept in this document deliberately:
+        // documents saved before its removal must still load, ignored.
         let contents = r#"{
             "requirements": [],
             "max_depth": 11,
@@ -826,7 +827,6 @@ mod tests {
         assert_eq!(query.max_depth, 11);
         assert!(query.require_blacksmith);
         assert!(query.exclude_blacksmith_rewards);
-        assert!(query.fast_mode);
         assert_eq!(
             query.challenges,
             Challenges::NO_HERBALISM | Challenges::NO_SCROLLS
@@ -990,7 +990,7 @@ mod tests {
                 "requirements": [
                     {"any_of": [
                         {"kind": "weapon", "item": "spear", "upgrade": 3},
-                        // Enchantments alphabetically, then curses alphabetically.
+                        // Journal order: enchantments by rarity, then the curses.
                         {"kind": "thrown_weapon",
                          "effect": ["Blazing", "Blocking", "Projecting", "Annoying", "Sacrificial"]},
                     ]},
@@ -1043,7 +1043,6 @@ mod tests {
             require_blacksmith: true,
             exclude_blacksmith_rewards: true,
             wandmaker_quest: None,
-            fast_mode: true,
         };
         let document = encode(&query);
         assert_eq!(
@@ -1065,7 +1064,6 @@ mod tests {
                 "max_depth": 19,
                 "require_blacksmith": true,
                 "exclude_blacksmith_rewards": true,
-                "fast_mode": true,
                 "challenges": ["barren_land", "forbidden_runes"],
             })
         );
@@ -1094,7 +1092,6 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
-            fast_mode: false,
         };
         assert_eq!(
             encode(&query).to_string(),

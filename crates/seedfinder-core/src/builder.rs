@@ -184,8 +184,9 @@ pub fn find_neighbours(rooms: &mut [Room], order: &[RoomId]) {
     }
 }
 
-/// `Builder.findFreeSpace`. The cumulative `inside` and `curDiff` variables
-/// inside each pass intentionally reproduce quirks in the Java source.
+/// `Builder.findFreeSpace`. Since v4.0.0 the closest-collision scan resets
+/// `inside` and the `curDiff` point for every room and ranks rooms by the
+/// Euclidean `Point.length()` of that point in `float` arithmetic.
 pub fn find_free_space(
     start: Point,
     rooms: &[Room],
@@ -299,9 +300,10 @@ fn free_space_from_collisions(
         // survivors, in their original order.
         let mut kept = 0_usize;
         let mut closest_room = None;
+        // Java initialises `closestDiff` to `(float) Integer.MAX_VALUE`, which
+        // every real candidate beats; `i32::MAX` is the same sentinel for the
+        // squared distances compared below.
         let mut closest_difference = i32::MAX;
-        let mut inside = true;
-        let mut current_difference = 0_i32;
         for index in 0..count {
             let bounds = colliding[index];
             // Everything below is predicated on `intersects` with conditional
@@ -313,36 +315,35 @@ fn free_space_from_collisions(
             colliding[kept] = bounds;
             kept += usize::from(intersects);
 
-            // Branch-free form of Java's axis checks: bounds are non-empty
-            // (left < right, top < bottom), so at most one term per axis is
-            // positive and equals exactly the summand the original branch
-            // chain would have added; boundary contact contributes zero but
-            // still clears `inside`, as the original `<=`/`>=` tests did.
-            // Rectangles the retain pass dropped contribute nothing.
-            let excess = bounds
+            // Branch-free form of Java's per-axis `curDiff` assignment: bounds
+            // are non-empty (left < right, top < bottom), so at most one term
+            // per axis is positive and equals exactly the value the original
+            // `<=`/`>=` branch chain would have stored; boundary contact
+            // stores zero but still clears `inside`.
+            let x_difference = bounds
                 .left
                 .wrapping_sub(start.x)
                 .max(0)
-                .wrapping_add(start.x.wrapping_sub(bounds.right).max(0))
-                .wrapping_add(bounds.top.wrapping_sub(start.y).max(0))
+                .wrapping_add(start.x.wrapping_sub(bounds.right).max(0));
+            let y_difference = bounds
+                .top
+                .wrapping_sub(start.y)
+                .max(0)
                 .wrapping_add(start.y.wrapping_sub(bounds.bottom).max(0));
-            current_difference =
-                current_difference.wrapping_add(if intersects { excess } else { 0 });
             #[allow(clippy::needless_bitwise_bool)]
             let strictly_inside = (start.x > bounds.left)
                 & (start.x < bounds.right)
                 & (start.y > bounds.top)
                 & (start.y < bounds.bottom);
-            #[allow(clippy::needless_bitwise_bool)]
-            {
-                inside &= strictly_inside | !intersects;
-            }
 
+            // `inside` is reset for every room, so any surviving room that
+            // strictly contains `start` collapses the space immediately.
             #[allow(clippy::needless_bitwise_bool)]
-            if inside & intersects {
+            if strictly_inside & intersects {
                 space.set(start.x, start.y, start.x, start.y);
                 return space;
             }
+            let current_difference = squared_point_length(x_difference, y_difference);
             #[allow(clippy::needless_bitwise_bool)]
             let better = intersects & (current_difference < closest_difference);
             closest_difference = if better {
@@ -410,6 +411,31 @@ fn free_space_from_collisions(
         }
     }
 }
+
+/// The squared length Java takes the square root of in `PointF.length()`.
+///
+/// The closest-collision scan only ever *orders* these lengths, and a square
+/// root is monotonic, so ordering the squares gives the same answer without
+/// one `sqrt` per rectangle per pass — a few hundred thousand of them per
+/// generated seed, in the hottest loop of the room builder.
+///
+/// Two different squares can only compare equal once `f32` rounding merges
+/// their roots, which needs a square above `MAX_EXACTLY_ORDERED_SQUARE`.
+/// Both arguments are non-negative distances inside one level, so the largest
+/// square a map can produce is four orders of magnitude below that;
+/// `squares_below_the_documented_bound_order_like_their_roots` pins the bound
+/// itself.
+fn squared_point_length(x: i32, y: i32) -> i32 {
+    let squared = x.wrapping_mul(x).wrapping_add(y.wrapping_mul(y));
+    debug_assert!(
+        (0..MAX_EXACTLY_ORDERED_SQUARE).contains(&squared),
+        "a level distance outside the range where squares order like their roots"
+    );
+    squared
+}
+
+/// Above this square, `f32(sqrt(n))` stops being strictly increasing in `n`.
+const MAX_EXACTLY_ORDERED_SQUARE: i32 = 1 << 22;
 
 /// Exact float/double operation ordering of `Builder.angleBetweenPoints`.
 fn angle_between_points(from: PointF, to: PointF) -> f32 {
@@ -1594,8 +1620,9 @@ mod tests {
 
     #[test]
     fn loop_builder_matches_pinned_java_room_graph() {
-        // Captured by running the v3.3.8 classes at commit 7b8b845a with the
-        // same initRooms subset. This covers failed-build retries, Java list
+        // Re-pinned from the v4.0.0 port after whole-floor parity with the
+        // official 4.0.0-BETA-3 JAR (findFreeSpace now ranks collisions by
+        // float Euclidean distance). This covers failed-build retries, Java list
         // shuffle order, tunnel decks, placement, closure, neighbours, and
         // connection insertion order.
         let mut rng = RandomStack::with_base_seed(0);
@@ -1646,8 +1673,8 @@ mod tests {
                 (
                     RoomKind::Exit(StandardRoomKind::CircleBasin),
                     Some(SizeCategory::Large),
-                    Rect::new(-21, 6, -9, 16),
-                    vec![6, 7, 10],
+                    Rect::new(-20, 5, -10, 17),
+                    vec![6, 7],
                 ),
                 (
                     RoomKind::Entrance(StandardRoomKind::WaterBridge),
@@ -1658,59 +1685,88 @@ mod tests {
                 (
                     RoomKind::Standard(StandardRoomKind::Ring),
                     Some(SizeCategory::Large),
-                    Rect::new(0, -10, 10, 0),
+                    Rect::new(-2, -9, 10, 0),
                     vec![9, 1],
                 ),
                 (
                     RoomKind::Standard(StandardRoomKind::SewerPipe),
                     Some(SizeCategory::Normal),
-                    Rect::new(-13, -1, -5, 5),
+                    Rect::new(-12, -4, -6, 4),
                     vec![10],
                 ),
                 (
                     RoomKind::Standard(StandardRoomKind::Burned),
                     Some(SizeCategory::Normal),
-                    Rect::new(-20, -5, -15, 0),
-                    vec![7, 8],
+                    Rect::new(-20, -6, -15, -2),
+                    vec![7, 8, 10],
                 ),
                 (
                     RoomKind::Standard(StandardRoomKind::SewerPipe),
                     Some(SizeCategory::Normal),
                     Rect::new(-5, 8, 3, 16),
-                    vec![1, 6, 10],
+                    vec![1, 6],
                 ),
                 (
                     RoomKind::Connection(ConnectionRoomKind::Walkway),
                     None,
-                    Rect::new(-9, 13, -5, 16),
+                    Rect::new(-10, 12, -5, 16),
                     vec![5, 0],
                 ),
                 (
                     RoomKind::Connection(ConnectionRoomKind::Tunnel),
                     None,
-                    Rect::new(-21, 0, -17, 6),
+                    Rect::new(-20, -2, -18, 5),
                     vec![0, 4],
                 ),
                 (
                     RoomKind::Connection(ConnectionRoomKind::Tunnel),
                     None,
-                    Rect::new(-15, -8, -6, -3),
+                    Rect::new(-15, -12, -8, -4),
                     vec![4, 9],
                 ),
                 (
                     RoomKind::Connection(ConnectionRoomKind::Tunnel),
                     None,
-                    Rect::new(-6, -9, 0, -1),
+                    Rect::new(-8, -11, -2, -5),
                     vec![8, 2],
                 ),
                 (
                     RoomKind::Connection(ConnectionRoomKind::Tunnel),
                     None,
-                    Rect::new(-9, 5, -5, 12),
-                    vec![5, 3, 0],
+                    Rect::new(-15, -4, -12, 2),
+                    vec![4, 3],
                 ),
             ]
         );
-        assert_eq!(rng.int(), -405_108_799);
+        assert_eq!(rng.int(), -597_342_396);
+    }
+
+    /// The closest-collision scan orders squared distances instead of the
+    /// `PointF.length()` values Java compares. That is only the same
+    /// comparison while `f32(sqrt(n))` is strictly increasing in `n`, so pin
+    /// the documented bound rather than trusting the arithmetic.
+    #[test]
+    #[allow(clippy::cast_possible_truncation)] // The narrowing under test.
+    fn squares_below_the_documented_bound_order_like_their_roots() {
+        let mut previous = f64::from(0_i32).sqrt() as f32;
+        for square in 1..=MAX_EXACTLY_ORDERED_SQUARE {
+            let root = f64::from(square).sqrt() as f32;
+            assert!(
+                root > previous,
+                "sqrt({square}) does not exceed sqrt({}) once rounded to f32",
+                square - 1
+            );
+            previous = root;
+        }
+        // And the bound is tight enough to be worth stating: just above it
+        // the rounding does start merging neighbours.
+        let mut merged = false;
+        let mut previous = f64::from(MAX_EXACTLY_ORDERED_SQUARE).sqrt() as f32;
+        for square in MAX_EXACTLY_ORDERED_SQUARE + 1..MAX_EXACTLY_ORDERED_SQUARE * 8 {
+            let root = f64::from(square).sqrt() as f32;
+            merged |= root == previous;
+            previous = root;
+        }
+        assert!(merged, "the bound is far looser than documented");
     }
 }

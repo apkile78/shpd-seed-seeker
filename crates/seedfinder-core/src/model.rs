@@ -3,6 +3,7 @@
 use crate::catalog::{Effect, ItemId};
 use crate::equipment::EquipmentRoll;
 use crate::quests::QuestSummary;
+use crate::run::RingGems;
 use crate::seed::DungeonSeed;
 
 /// Where an item can be obtained in the generated world.
@@ -24,7 +25,12 @@ pub enum ItemSource {
     GhostReward,
     WandmakerReward,
     BlacksmithReward,
+    /// One of the Imp's six vault-prize options (v4.0.0), laid out in the
+    /// vault's final room; the player brings exactly one vault item home.
     ImpReward,
+    /// Equipment placed in the Imp's vault sub-level by its treasure rooms
+    /// (v4.0.0). Shares the Imp reward's single-pick choice group.
+    VaultTreasure,
 }
 
 impl ItemSource {
@@ -50,6 +56,7 @@ impl ItemSource {
         Self::WandmakerReward,
         Self::BlacksmithReward,
         Self::ImpReward,
+        Self::VaultTreasure,
     ];
 }
 
@@ -146,4 +153,10 @@ pub struct GeneratedWorld {
     pub items: Vec<WorldItem>,
     /// Quest variants rolled while generating the requested prefix.
     pub quests: QuestSummary,
+    /// The gem this run gave each ring class, and so the `items.png` cell every
+    /// ring in [`Self::items`] is drawn in. Like [`Self::quests`] this belongs
+    /// to the run rather than to any one item: `Dungeon.init()` shuffles
+    /// `Ring.gems` once, before the first floor exists. Resolve a cell with
+    /// [`crate::catalog::ItemDefinition::sprite_index_in`].
+    pub ring_gems: RingGems,
 }

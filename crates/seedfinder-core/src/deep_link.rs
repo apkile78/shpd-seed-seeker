@@ -1,10 +1,14 @@
 //! Compact shareable-link codec for search queries.
 //!
 //! A deep link carries a whole query as a short base64url code, e.g.
-//! `https://shpd-seed-seeker.web.app/#q=EAEkgA`. The payload is a versioned
+//! `https://shpd-seed-seeker.web.app/#q=QAMtCYAA`. The payload is a versioned
 //! bit stream, so codes shared today must keep decoding in every future
 //! release: the numeric code tables below are frozen by tests and may only
-//! ever grow at the end.
+//! ever grow at the end. There is a single live format version: versions 1
+//! and 2 were retired while the feature had next to no users (the effect
+//! table was also re-frozen in journal order at the same time), and version
+//! 3 — the same layout plus the retired fast-mode bit — went with the flag,
+//! so decoding rejects them instead of carrying translation code forever.
 
 // Every narrowing cast in this module operates on a value already masked or
 // bounds-checked to fewer bits than the destination type.
@@ -27,17 +31,16 @@ pub const WEB_LINK_PREFIX: &str = "https://shpd-seed-seeker.web.app/#q=";
 /// Custom URI scheme registered by the desktop apps.
 pub const URI_SCHEME: &str = "seedseeker";
 
-/// The original format: one optional effect per requirement, no groups
-/// beyond same-item groups. Still written whenever a query needs nothing
-/// more, so links keep opening in releases that predate version 2.
-const VERSION_ONE: u8 = 1;
-/// Adds effect sets, alternative groups and combined-level groups to each
-/// requirement. Written only when a query uses one of them.
-const VERSION_TWO: u8 = 2;
+/// The only format read or written: effect sets as a 32-bit mask,
+/// alternative groups and combined-level groups per requirement. Versions 1
+/// through 3 are rejected as unsupported (3 differed only in carrying the
+/// retired fast-mode bit).
+const VERSION: u8 = 4;
 /// Requirement-count field width; far above anything the UIs produce.
 const MAX_REQUIREMENTS: usize = 63;
-/// Effect-set mask width; both families define 21 effects, frozen by a test.
-const EFFECT_MASK_BITS: u32 = 24;
+/// Effect-set mask width: the weapon family has 27 effects, with room to
+/// spare. Frozen by a test.
+const EFFECT_MASK_BITS: u32 = 32;
 
 const BASE64URL: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
@@ -89,16 +92,10 @@ pub fn encode(query: &SearchQuery) -> Result<String, String> {
     // Alternative groups are renumbered in first-appearance order so the
     // labels fit the count field; the structure is all that travels.
     let mut alternative_labels: Vec<u8> = Vec::new();
-    let version = if needs_version_two(query) {
-        VERSION_TWO
-    } else {
-        VERSION_ONE
-    };
     let mut bits = BitWriter::default();
-    bits.push(version.into(), 4);
+    bits.push(VERSION.into(), 4);
     bits.push(query.require_blacksmith.into(), 1);
     bits.push(query.exclude_blacksmith_rewards.into(), 1);
-    bits.push(query.fast_mode.into(), 1);
     push_optional(&mut bits, query.max_depth != 24, || {
         (u32::from(query.max_depth) - 1, 5)
     });
@@ -115,20 +112,21 @@ pub fn encode(query: &SearchQuery) -> Result<String, String> {
     });
     bits.push(query.requirements.len() as u32, 6);
     for requirement in &query.requirements {
-        encode_requirement(&mut bits, requirement, version, &mut alternative_labels);
+        encode_requirement(&mut bits, requirement, &mut alternative_labels);
     }
     Ok(base64url_encode(&bits.finish()))
 }
 
-/// Whether a query uses anything the version-one layout cannot carry: a
-/// real alternative group (one member is just a requirement), a
-/// combined-level group, or an effect set of more than one effect.
-fn needs_version_two(query: &SearchQuery) -> bool {
-    query.slots().iter().any(|slot| slot.len() > 1)
-        || query.requirements.iter().any(|requirement| {
-            requirement.level_sum.is_some()
-                || matches!(requirement.effect, EffectRequirement::OneOf(set) if set.count() != 1)
-        })
+/// How a record carries an effect set: `1` a single effect, `2` the
+/// family's whole enchantment list, `3` a mask.
+fn effect_set_mode(set: EffectSet) -> u32 {
+    if set.count() == 1 {
+        1
+    } else if EffectSet::enchantments(set.family()) == Some(set) {
+        2
+    } else {
+        3
+    }
 }
 
 /// Encodes a validated query as a full shareable web link.
@@ -150,17 +148,14 @@ pub fn decode(code: &str) -> Result<SearchQuery, String> {
     let bytes = base64url_decode(code.trim())?;
     let mut bits = BitReader::new(&bytes);
     let version = bits.pull(4)?;
-    if version != u32::from(VERSION_ONE) && version != u32::from(VERSION_TWO) {
+    if version != u32::from(VERSION) {
         return Err(format!(
             "this link uses format version {version}; this app only understands \
-             versions {VERSION_ONE} and {VERSION_TWO} — it may have been created by a newer \
-             release"
+             version {VERSION} — it may have been created by a different release"
         ));
     }
-    let version = version as u8;
     let require_blacksmith = bits.pull(1)? == 1;
     let exclude_blacksmith_rewards = bits.pull(1)? == 1;
-    let fast_mode = bits.pull(1)? == 1;
     let max_depth = if bits.pull(1)? == 1 {
         depth_from(bits.pull(5)?)?
     } else {
@@ -179,7 +174,7 @@ pub fn decode(code: &str) -> Result<SearchQuery, String> {
     let count = bits.pull(6)?;
     let requirements = (0..count)
         .map(|index| {
-            decode_requirement(&mut bits, version)
+            decode_requirement(&mut bits)
                 .map_err(|error| format!("requirement {}: {error}", index + 1))
         })
         .collect::<Result<Vec<_>, _>>()?;
@@ -191,7 +186,6 @@ pub fn decode(code: &str) -> Result<SearchQuery, String> {
         require_blacksmith,
         exclude_blacksmith_rewards,
         wandmaker_quest,
-        fast_mode,
     };
     query
         .validate()
@@ -245,7 +239,6 @@ pub fn decode_text(text: &str) -> Result<SearchQuery, String> {
 fn encode_requirement(
     bits: &mut BitWriter,
     requirement: &Requirement,
-    version: u8,
     alternative_labels: &mut Vec<u8>,
 ) {
     bits.push(kind_code(requirement.kind, requirement.weapon_category), 3);
@@ -264,26 +257,18 @@ fn encode_requirement(
         UpgradeRequirement::AtLeast(value) => push_filter(bits, 2, value),
     }
     match requirement.effect {
-        EffectRequirement::Any if version == VERSION_ONE => bits.push(0, 1),
-        EffectRequirement::OneOf(set) if version == VERSION_ONE => {
-            // Version one carries exactly one effect; `needs_version_two`
-            // guarantees the set is a singleton here.
-            bits.push(1, 1);
-            bits.push(set.effects().next().map_or(0, effect_code), 5);
-        }
         EffectRequirement::Any => bits.push(0, 2),
         EffectRequirement::OneOf(set) => {
-            if set.count() == 1 {
-                bits.push(1, 2);
-                bits.push(set.effects().next().map_or(0, effect_code), 5);
-            } else if EffectSet::enchantments(set.family()) == Some(set) {
-                bits.push(2, 2);
-            } else {
-                bits.push(3, 2);
-                bits.push(
+            let mode = effect_set_mode(set);
+            bits.push(mode, 2);
+            match mode {
+                1 => bits.push(set.effects().next().map_or(0, effect_code), 5),
+                2 => {}
+                // Every effect code fits the mask width; a test freezes it.
+                _ => bits.push(
                     set.effects().map(|effect| 1 << effect_code(effect)).sum(),
                     EFFECT_MASK_BITS,
-                );
+                ),
             }
         }
     }
@@ -297,9 +282,6 @@ fn encode_requirement(
     push_optional(&mut *bits, requirement.max_depth.is_some(), || {
         (u32::from(requirement.max_depth.unwrap()) - 1, 5)
     });
-    if version == VERSION_ONE {
-        return;
-    }
     push_optional(&mut *bits, requirement.alternative_group.is_some(), || {
         let group = requirement.alternative_group.unwrap();
         let label = alternative_labels
@@ -320,7 +302,7 @@ fn encode_requirement(
     });
 }
 
-fn decode_requirement(bits: &mut BitReader<'_>, version: u8) -> Result<Requirement, String> {
+fn decode_requirement(bits: &mut BitReader<'_>) -> Result<Requirement, String> {
     let (kind, weapon_category) = kind_from(bits.pull(3)?)?;
     let item = if bits.pull(1)? == 1 {
         Some(item_from(bits.pull(7)?)?)
@@ -339,31 +321,23 @@ fn decode_requirement(bits: &mut BitReader<'_>, version: u8) -> Result<Requireme
         (2, bits) => UpgradeRequirement::AtLeast(bits.pull(3)? as u8),
         (mode, _) => return Err(format!("unknown upgrade mode {mode}")),
     };
-    let effect = if version == VERSION_ONE {
-        if bits.pull(1)? == 1 {
-            EffectRequirement::exactly(effect_from(kind, bits.pull(5)?)?)
-        } else {
-            EffectRequirement::Any
-        }
-    } else {
-        match bits.pull(2)? {
-            0 => EffectRequirement::Any,
-            1 => EffectRequirement::exactly(effect_from(kind, bits.pull(5)?)?),
-            2 => EffectRequirement::OneOf(
-                EffectSet::enchantments(kind)
-                    .ok_or_else(|| "any-enchantment needs a weapon or armor".to_owned())?,
-            ),
-            _ => {
-                let mask = bits.pull(EFFECT_MASK_BITS)?;
-                let effects = (0..EFFECT_MASK_BITS)
-                    .filter(|code| mask & (1 << code) != 0)
-                    .map(|code| effect_from(kind, code))
-                    .collect::<Result<Vec<_>, _>>()?;
-                EffectRequirement::OneOf(
-                    EffectSet::from_effects(effects)
-                        .ok_or_else(|| "effect set must not be empty".to_owned())?,
-                )
-            }
+    let effect = match bits.pull(2)? {
+        0 => EffectRequirement::Any,
+        1 => EffectRequirement::exactly(effect_from(kind, bits.pull(5)?)?),
+        2 => EffectRequirement::OneOf(
+            EffectSet::enchantments(kind)
+                .ok_or_else(|| "any-enchantment needs a weapon or armor".to_owned())?,
+        ),
+        _ => {
+            let mask = bits.pull(EFFECT_MASK_BITS)?;
+            let effects = (0..EFFECT_MASK_BITS)
+                .filter(|code| mask & (1 << code) != 0)
+                .map(|code| effect_from(kind, code))
+                .collect::<Result<Vec<_>, _>>()?;
+            EffectRequirement::OneOf(
+                EffectSet::from_effects(effects)
+                    .ok_or_else(|| "effect set must not be empty".to_owned())?,
+            )
         }
     };
     let require_uncursed = bits.pull(1)? == 1;
@@ -385,25 +359,20 @@ fn decode_requirement(bits: &mut BitReader<'_>, version: u8) -> Result<Requireme
     } else {
         None
     };
-    let (alternative_group, level_sum) = if version == VERSION_ONE {
-        (None, None)
+    let alternative_group = if bits.pull(1)? == 1 {
+        // Labels are zero-based on the wire and one-based in the query.
+        Some(bits.pull(6)? as u8 + 1)
     } else {
-        let alternative_group = if bits.pull(1)? == 1 {
-            // Labels are zero-based on the wire and one-based in the query.
-            Some(bits.pull(6)? as u8 + 1)
-        } else {
-            None
-        };
-        let level_sum = if bits.pull(1)? == 1 {
-            let packed = bits.pull(10)?;
-            Some(LevelSum {
-                group: (packed >> 8) as u8 + 1,
-                minimum_total: (packed & 0xff) as u8,
-            })
-        } else {
-            None
-        };
-        (alternative_group, level_sum)
+        None
+    };
+    let level_sum = if bits.pull(1)? == 1 {
+        let packed = bits.pull(10)?;
+        Some(LevelSum {
+            group: (packed >> 8) as u8 + 1,
+            minimum_total: (packed & 0xff) as u8,
+        })
+    } else {
+        None
     };
     Ok(Requirement {
         kind,
@@ -734,6 +703,11 @@ mod tests {
         extract_code,
     };
 
+    /// The format version a code was written with (its top nibble).
+    fn version_of(code: &str) -> u8 {
+        super::base64url_decode(code).unwrap()[0] >> 4
+    }
+
     fn wildcard(kind: ItemKind) -> Requirement {
         Requirement {
             kind,
@@ -759,7 +733,6 @@ mod tests {
             require_blacksmith: false,
             exclude_blacksmith_rewards: false,
             wandmaker_quest: None,
-            fast_mode: false,
         }
     }
 
@@ -814,7 +787,6 @@ mod tests {
             require_blacksmith: true,
             exclude_blacksmith_rewards: true,
             wandmaker_quest: Some(WandmakerQuestType::Rotberry),
-            fast_mode: true,
         };
         let code = encode(&query).unwrap();
         assert_eq!(decode(&code).unwrap(), query);
@@ -918,8 +890,8 @@ mod tests {
         // A hand-crafted stream carrying group 200: the wire field is eight
         // bits, so out-of-range groups must die in the decoder.
         let mut bits = super::BitWriter::default();
-        bits.push(1, 4); // version
-        bits.push(0, 3); // flags
+        bits.push(4, 4); // version
+        bits.push(0, 2); // flags
         bits.push(0, 1); // max depth absent
         bits.push(0, 1); // challenges absent
         bits.push(0, 1); // Wandmaker filter absent
@@ -928,12 +900,14 @@ mod tests {
         bits.push(0, 1); // item absent
         bits.push(0, 2); // tier any
         bits.push(0, 2); // upgrade any
-        bits.push(0, 1); // effect absent
+        bits.push(0, 2); // effect any
         bits.push(0, 1); // cursed allowed
         bits.push(0, 1); // source absent
         bits.push(1, 1); // identity group present
         bits.push(200, 8);
         bits.push(0, 1); // requirement depth absent
+        bits.push(0, 1); // alternative group absent
+        bits.push(0, 1); // combined-level group absent
         let code = super::base64url_encode(&bits.finish());
         assert!(decode(&code).unwrap_err().contains("A..D"));
     }
@@ -943,8 +917,8 @@ mod tests {
         assert!(decode("").is_err());
         assert!(decode("!!!").is_err());
         assert!(decode("A").is_err());
-        // Unsupported future version (bits 0100 in the top nibble).
-        assert!(decode("QAAA").unwrap_err().contains("version 4"));
+        // Unsupported future version (bits 0101 in the top nibble).
+        assert!(decode("UAAA").unwrap_err().contains("version 5"));
         let code = encode(&minimal(vec![wildcard(ItemKind::Wand)])).unwrap();
         assert!(decode(&code[..code.len() - 1]).is_err());
         assert!(decode(&format!("{code}AAAA")).is_err());
@@ -957,8 +931,8 @@ mod tests {
     fn unknown_category_codes_are_named_in_the_error() {
         for code in 6..=7 {
             let mut bits = super::BitWriter::default();
-            bits.push(1, 4); // version
-            bits.push(0, 3); // flags
+            bits.push(4, 4); // version
+            bits.push(0, 2); // flags
             bits.push(0, 1); // max depth absent
             bits.push(0, 1); // challenges absent
             bits.push(0, 1); // Wandmaker filter absent
@@ -1101,28 +1075,36 @@ mod tests {
         // Every catalog item must be representable in a link.
         assert_eq!(ALL_ITEM_IDS.len(), crate::catalog::ITEMS.len());
 
+        // Journal order: enchantments by rarity, then the curses. Frozen
+        // when versions 1 and 2 were retired; may only ever grow at the end.
         let expected_weapon_effects = [
             "Blazing",
             "Chilling",
             "Kinetic",
             "Shocking",
+            "Venomous",
             "Blocking",
             "Blooming",
+            "Eldritch",
             "Elastic",
             "Lucky",
             "Projecting",
             "Unstable",
+            "Vorpal",
             "Corrupting",
+            "Crystal",
             "Grim",
             "Vampiric",
             "Annoying",
             "Displacing",
             "Dazzling",
             "Explosive",
+            "Friendly",
+            "Polarized",
+            "Pressurized",
             "Sacrificial",
             "Wayward",
-            "Polarized",
-            "Friendly",
+            "Wondrous",
         ];
         let expected_armor_effects = [
             "Obfuscation",
@@ -1180,6 +1162,7 @@ mod tests {
             "wandmaker_reward",
             "blacksmith_reward",
             "imp_reward",
+            "vault_treasure",
         ];
         assert_eq!(
             SOURCE_CODES
@@ -1210,18 +1193,20 @@ mod tests {
         );
     }
 
-    /// Queries that need nothing beyond version one keep writing it, so the
-    /// links they produce open in releases that predate version two.
+    /// Every code carries the one live version, plain or loaded.
     #[test]
-    fn plain_queries_still_write_version_one() {
-        let query = minimal(vec![Requirement {
-            effect: EffectRequirement::exactly(Effect::Weapon(WeaponEffect::Grim)),
-            ..wildcard(ItemKind::Weapon)
-        }]);
-        let code = encode(&query).unwrap();
-        let first = super::base64url_decode(&code).unwrap()[0];
-        assert_eq!(first >> 4, super::VERSION_ONE);
-        assert_eq!(decode(&code).unwrap(), query);
+    fn every_code_writes_the_single_version() {
+        for query in [
+            minimal(vec![wildcard(ItemKind::Wand)]),
+            minimal(vec![Requirement {
+                effect: EffectRequirement::exactly(Effect::Weapon(WeaponEffect::Grim)),
+                ..wildcard(ItemKind::Weapon)
+            }]),
+        ] {
+            let code = encode(&query).unwrap();
+            assert_eq!(version_of(&code), super::VERSION);
+            assert_eq!(decode(&code).unwrap(), query);
+        }
     }
 
     #[test]
@@ -1258,8 +1243,6 @@ mod tests {
         };
         let query = minimal(vec![some_of, any_enchantment, other, ring, ring]);
         let code = encode(&query).unwrap();
-        let first = super::base64url_decode(&code).unwrap()[0];
-        assert_eq!(first >> 4, super::VERSION_TWO);
         let decoded = decode(&code).unwrap();
         // Alternative labels are renumbered; everything else is verbatim.
         let mut expected = query.clone();
@@ -1279,7 +1262,7 @@ mod tests {
                 group: 5,
                 minimum_total: 1,
             }),
-            ..wildcard(ItemKind::Wand)
+            ..wildcard(ItemKind::Ring)
         }]);
         let error = encode(&query).unwrap_err();
         assert!(error.contains("combined level group"), "{error}");
@@ -1287,13 +1270,140 @@ mod tests {
 
     #[test]
     fn effect_masks_fit_every_family() {
-        assert!(ALL_WEAPON_EFFECTS.len() as u32 <= EFFECT_MASK_BITS);
+        assert_eq!(EFFECT_MASK_BITS, 32);
         assert!(ALL_ARMOR_EFFECTS.len() as u32 <= EFFECT_MASK_BITS);
+        assert!(ALL_WEAPON_EFFECTS.len() as u32 <= EFFECT_MASK_BITS);
+        // Single effects travel as a 5-bit code.
+        assert!(ALL_WEAPON_EFFECTS.len() <= 32);
     }
 
-    /// A known version-two code must decode identically forever.
     #[test]
-    fn version_two_codes_are_stable() {
+    fn round_trips_effect_sets_across_the_whole_table() {
+        for effects in [
+            vec![
+                Effect::Weapon(WeaponEffect::Crystal),
+                Effect::Weapon(WeaponEffect::Pressurized),
+            ],
+            vec![
+                Effect::Weapon(WeaponEffect::Venomous),
+                Effect::Weapon(WeaponEffect::Vorpal),
+            ],
+            vec![
+                Effect::Weapon(WeaponEffect::Blocking),
+                Effect::Weapon(WeaponEffect::Projecting),
+                Effect::Weapon(WeaponEffect::Vampiric),
+            ],
+        ] {
+            let query = minimal(vec![Requirement {
+                effect: EffectRequirement::OneOf(EffectSet::from_effects(effects).unwrap()),
+                ..wildcard(ItemKind::Weapon)
+            }]);
+            assert_eq!(decode(&encode(&query).unwrap()).unwrap(), query);
+        }
+
+        // The whole-family mode and a single effect ride modes of their own.
+        let any_enchantment = minimal(vec![Requirement {
+            effect: EffectRequirement::OneOf(EffectSet::enchantments(ItemKind::Weapon).unwrap()),
+            ..wildcard(ItemKind::Weapon)
+        }]);
+        assert_eq!(
+            decode(&encode(&any_enchantment).unwrap()).unwrap(),
+            any_enchantment
+        );
+        let single = minimal(vec![Requirement {
+            effect: EffectRequirement::exactly(Effect::Weapon(WeaponEffect::Wondrous)),
+            ..wildcard(ItemKind::Weapon)
+        }]);
+        assert_eq!(decode(&encode(&single).unwrap()).unwrap(), single);
+    }
+
+    /// The mask stays 32 bits wide whatever the catalog grows to: a
+    /// hand-built stream must keep decoding bit for bit.
+    #[test]
+    fn effect_masks_stay_thirty_two_bits_wide() {
+        let mut bits = super::BitWriter::default();
+        bits.push(4, 4); // version
+        bits.push(0, 2); // flags
+        bits.push(0, 1); // max depth absent
+        bits.push(0, 1); // challenges absent
+        bits.push(0, 1); // Wandmaker filter absent
+        bits.push(1, 6); // one requirement
+        bits.push(0, 3); // weapon
+        bits.push(0, 1); // item absent
+        bits.push(0, 2); // tier any
+        bits.push(0, 2); // upgrade any
+        bits.push(3, 2); // effect set
+        bits.push((1 << 5) | (1 << 10) | (1 << 16), 32); // Blocking, Projecting, Vampiric
+        bits.push(0, 1); // cursed allowed
+        bits.push(0, 1); // source absent
+        bits.push(0, 1); // identity group absent
+        bits.push(0, 1); // requirement depth absent
+        bits.push(0, 1); // alternative group absent
+        bits.push(0, 1); // combined-level group absent
+        let code = super::base64url_encode(&bits.finish());
+        let expected = minimal(vec![Requirement {
+            effect: EffectRequirement::OneOf(
+                EffectSet::from_effects([
+                    Effect::Weapon(WeaponEffect::Blocking),
+                    Effect::Weapon(WeaponEffect::Projecting),
+                    Effect::Weapon(WeaponEffect::Vampiric),
+                ])
+                .unwrap(),
+            ),
+            ..wildcard(ItemKind::Weapon)
+        }]);
+        assert_eq!(decode(&code).unwrap(), expected);
+        assert_eq!(encode(&expected).unwrap(), code);
+    }
+
+    /// Upgrade values ride three bits, so the v4.0.0 ceilings — weapons +5,
+    /// everything else +4 — round-trip in the original version.
+    #[test]
+    fn round_trips_the_raised_upgrade_ceilings() {
+        for (kind, upgrade) in [
+            (ItemKind::Weapon, UpgradeRequirement::Exact(5)),
+            (ItemKind::Weapon, UpgradeRequirement::AtLeast(5)),
+            (ItemKind::Armor, UpgradeRequirement::Exact(4)),
+            (ItemKind::Wand, UpgradeRequirement::AtLeast(4)),
+        ] {
+            let query = minimal(vec![Requirement {
+                upgrade,
+                ..wildcard(kind)
+            }]);
+            let code = encode(&query).unwrap();
+            assert_eq!(decode(&code).unwrap(), query, "{kind:?} {upgrade:?}");
+        }
+        let thrown = minimal(vec![Requirement {
+            weapon_category: Some(WeaponCategory::Thrown),
+            upgrade: UpgradeRequirement::Exact(5),
+            ..wildcard(ItemKind::Weapon)
+        }]);
+        assert_eq!(decode(&encode(&thrown).unwrap()).unwrap(), thrown);
+    }
+
+    /// The vault-treasure source took the next free code at the end of the
+    /// source table, so it fits the original five-bit field.
+    #[test]
+    fn round_trips_the_vault_treasure_source() {
+        let query = minimal(vec![Requirement {
+            item: Some(ItemId::PlateArmor),
+            upgrade: UpgradeRequirement::AtLeast(3),
+            source: Some(ItemSource::VaultTreasure),
+            ..wildcard(ItemKind::Armor)
+        }]);
+        let code = encode(&query).unwrap();
+        assert_eq!(super::source_code(ItemSource::VaultTreasure), 17);
+        assert_eq!(decode(&code).unwrap(), query);
+        assert_eq!(
+            json_query::encode(&decode(&code).unwrap())["requirements"][0]["source"],
+            "vault_treasure"
+        );
+    }
+
+    /// A known code must decode identically forever; this pins the
+    /// byte-level format.
+    #[test]
+    fn codes_are_stable() {
         let query = minimal(vec![
             Requirement {
                 item: Some(ItemId::Spear),
@@ -1302,37 +1412,26 @@ mod tests {
                 ..wildcard(ItemKind::Weapon)
             },
             Requirement {
-                item: Some(ItemId::Sword),
-                upgrade: UpgradeRequirement::Exact(1),
+                effect: EffectRequirement::exactly(Effect::Weapon(WeaponEffect::Crystal)),
                 alternative_group: Some(1),
                 ..wildcard(ItemKind::Weapon)
             },
         ]);
         let code = encode(&query).unwrap();
         assert_eq!(decode(&code).unwrap(), query);
-        assert_eq!(code, "IAIQ4sCAEWJAgA");
-        assert_eq!(decode("IAIQ4sCAEWJAgA").unwrap(), query);
+        assert_eq!(code, "QAQhxYEAALggAA");
+        assert_eq!(decode("QAQhxYEAALggAA").unwrap(), query);
     }
 
-    /// A known code must decode identically forever; this pins the byte-level
-    /// format of version 1.
+    /// Codes from the retired versions 1 through 3 are rejected by version,
+    /// not misread: their layouts (and, for 1 and 2, effect tables) no
+    /// longer apply. `MAGWhMAA` was version 3's pinned fixture.
     #[test]
-    fn version_one_codes_are_stable() {
-        let query = SearchQuery {
-            requirements: vec![Requirement {
-                item: Some(ItemId::WandFireblast),
-                upgrade: UpgradeRequirement::AtLeast(3),
-                ..wildcard(ItemKind::Wand)
-            }],
-            max_depth: 24,
-            challenges: Challenges::NONE,
-            require_blacksmith: false,
-            exclude_blacksmith_rewards: false,
-            wandmaker_quest: None,
-            fast_mode: false,
-        };
-        let code = encode(&query).unwrap();
-        assert_eq!(code, "EAGWhMA");
-        assert_eq!(decode("EAGWhMA").unwrap(), query);
+    fn retired_versions_are_rejected() {
+        for code in ["EAGWhMA", "IAIQ4sCAEWJAgA", "MAGWhMAA"] {
+            let error = decode(code).unwrap_err();
+            assert!(error.contains("format version"), "{error}");
+            assert!(error.contains("only understands version 4"), "{error}");
+        }
     }
 }

@@ -9,7 +9,9 @@
 
 use serde_json::{Value, json};
 
-use crate::catalog::ItemKind;
+use crate::catalog::{
+    EXTRA_UPGRADE_TIER, ItemKind, MAX_GENERATED_UPGRADE, MAX_STANDARD_RING_UPGRADE,
+};
 use crate::feasibility::Quest;
 use crate::json_query::CHALLENGE_NAMES;
 use crate::main_world::EMPTY_BOSS_FLOORS;
@@ -39,8 +41,30 @@ pub fn document() -> Value {
             "boundedTierMax": BOUNDED_TIER_MAX,
             "identityGroupMax": MAX_IDENTITY_GROUP,
             "levelSumGroupMax": MAX_LEVEL_SUM_GROUP,
-            "maxUpgradeDefault": ItemKind::Weapon.maximum_search_upgrade(),
+            // `maxUpgradeDefault` predates per-kind ceilings; it is the
+            // ceiling shared by armor, wands and rings, while weapons (melee
+            // and thrown) reach `maxUpgradeWeapon`.
+            "maxUpgradeDefault": ItemKind::Armor.maximum_search_upgrade(),
             "maxUpgradeRing": ItemKind::Ring.maximum_search_upgrade(),
+            // A world levels at most one ring — the Imp vault's prize —
+            // beyond this, so a combined-level group of n rings reaches
+            // (maxUpgradeRing + 1) + (n - 1) * (maxUpgradeRingStandard + 1)
+            // levels, each ring counting its upgrade plus one.
+            "maxUpgradeRingStandard": MAX_STANDARD_RING_UPGRADE,
+            "maxUpgradeWeapon": ItemKind::Weapon.maximum_search_upgrade(),
+            "maxUpgradeByKind": {
+                "weapon": ItemKind::Weapon.maximum_search_upgrade(),
+                "armor": ItemKind::Armor.maximum_search_upgrade(),
+                "wand": ItemKind::Wand.maximum_search_upgrade(),
+                "ring": ItemKind::Ring.maximum_search_upgrade(),
+            },
+            // The per-kind ceilings above are what a weapon reaches at its
+            // best tier. Only tier `extraUpgradeTier` gets there: every other
+            // tier, and every other family, stops at `maxUpgradeAnyTier`, so
+            // an editor offering the top level has to know the tier the
+            // requirement is asking for.
+            "maxUpgradeAnyTier": MAX_GENERATED_UPGRADE,
+            "extraUpgradeTier": EXTRA_UPGRADE_TIER,
             "resultsFileMaxBytes": MAX_FILE_BYTES,
         },
         "emptyBossFloors": EMPTY_BOSS_FLOORS,
@@ -98,8 +122,16 @@ mod tests {
         assert_eq!(info["limits"]["boundedTierMax"], 4);
         assert_eq!(info["limits"]["identityGroupMax"], 4);
         assert_eq!(info["limits"]["levelSumGroupMax"], 4);
-        assert_eq!(info["limits"]["maxUpgradeDefault"], 3);
+        assert_eq!(info["limits"]["maxUpgradeDefault"], 4);
         assert_eq!(info["limits"]["maxUpgradeRing"], 4);
+        assert_eq!(info["limits"]["maxUpgradeRingStandard"], 2);
+        assert_eq!(info["limits"]["maxUpgradeWeapon"], 5);
+        assert_eq!(
+            info["limits"]["maxUpgradeByKind"],
+            serde_json::json!({"weapon": 5, "armor": 4, "wand": 4, "ring": 4})
+        );
+        assert_eq!(info["limits"]["maxUpgradeAnyTier"], 4);
+        assert_eq!(info["limits"]["extraUpgradeTier"], 4);
         assert_eq!(info["limits"]["resultsFileMaxBytes"], 2 * 1_024 * 1_024);
         assert_eq!(
             info["limits"]
@@ -112,11 +144,16 @@ mod tests {
                 "boundedTierMin",
                 "exactTierMax",
                 "exactTierMin",
+                "extraUpgradeTier",
                 "identityGroupMax",
                 "levelSumGroupMax",
                 "maxDepth",
+                "maxUpgradeAnyTier",
+                "maxUpgradeByKind",
                 "maxUpgradeDefault",
                 "maxUpgradeRing",
+                "maxUpgradeRingStandard",
+                "maxUpgradeWeapon",
                 "resultsFileMaxBytes",
             ]
         );

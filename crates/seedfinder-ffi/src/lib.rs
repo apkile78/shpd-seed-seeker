@@ -2,14 +2,23 @@
 
 #![allow(unsafe_code)]
 
+// Level generation is allocation-bound: a deep seed churns thousands of small
+// buffers, and the platform allocators serialize badly across search workers.
+// Every artifact built from this crate — the Windows DLL, the macOS
+// staticlib — therefore carries mimalloc, exactly as the CLI does.
+#[global_allocator]
+static GLOBAL_ALLOCATOR: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+use std::num::NonZeroUsize;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::ptr;
 
 use shpd_seedfinder_core::{deep_link, engine_info, json_query, results_export, seed};
 use shpd_seedfinder_session::{
     FilterPacketError, MAX_RESULTS, NativeSession, ScoutCallError, ScoutMatchError,
-    ScoutPacketError, SearchError, StartSessionError, close_session, decide_start_packets, json,
-    production_filter_packet, production_scout_packet, queries_continue, registry,
+    ScoutPacketError, SearchError, StartSessionError, available_workers, close_session,
+    decide_start_packets, json, production_filter_packet, production_scout_packet,
+    queries_continue, registry,
 };
 
 const OK: i32 = 0;
@@ -52,13 +61,19 @@ fn clear_outputs(out_packet: *mut *mut u8, out_len: *mut usize) {
     }
 }
 
+/// `workers` is the number of search threads to spawn, clamped to the host's
+/// parallelism; 0 uses every available core.
 #[unsafe(no_mangle)]
-pub extern "C" fn seedfinder_start_search(request: *const u8, request_len: usize) -> i64 {
+pub extern "C" fn seedfinder_start_search(
+    request: *const u8,
+    request_len: usize,
+    workers: u32,
+) -> i64 {
     catch_unwind(AssertUnwindSafe(|| {
         let Some(bytes) = request_slice(request, request_len) else {
             return 0;
         };
-        match NativeSession::production_from_packet(bytes) {
+        match NativeSession::production_from_packet(bytes, requested_workers(workers)) {
             Ok(session) => registry().insert(session),
             Err(StartSessionError::Request(_) | StartSessionError::Spawn(_)) => 0,
         }
@@ -69,24 +84,39 @@ pub extern "C" fn seedfinder_start_search(request: *const u8, request_len: usize
 /// Starts a search which resumes a previous traversal: it scans only the
 /// `scan_len` seeds beginning at `resume_from`, wrapping at the end of the
 /// seed space. Callers obtain both values from `seedfinder_resume_hint` on the
-/// stopped or completed session being refined.
+/// stopped or completed session being refined. `workers` behaves exactly as in
+/// `seedfinder_start_search`.
 #[unsafe(no_mangle)]
 pub extern "C" fn seedfinder_start_resumed_search(
     request: *const u8,
     request_len: usize,
     resume_from: u64,
     scan_len: u64,
+    workers: u32,
 ) -> i64 {
     catch_unwind(AssertUnwindSafe(|| {
         let Some(bytes) = request_slice(request, request_len) else {
             return 0;
         };
-        match NativeSession::production_resumed_from_packet(bytes, resume_from, scan_len) {
+        let workers = requested_workers(workers);
+        match NativeSession::production_resumed_from_packet(bytes, resume_from, scan_len, workers) {
             Ok(session) => registry().insert(session),
             Err(StartSessionError::Request(_) | StartSessionError::Spawn(_)) => 0,
         }
     }))
     .unwrap_or(0)
+}
+
+/// Logical processors available to search workers, never less than one: the
+/// ceiling for a frontend's worker selector.
+#[unsafe(no_mangle)]
+pub extern "C" fn seedfinder_available_workers() -> u32 {
+    u32::try_from(available_workers()).unwrap_or(u32::MAX)
+}
+
+/// Maps the ABI's `0` = every available core onto the session API's `None`.
+fn requested_workers(workers: u32) -> Option<NonZeroUsize> {
+    NonZeroUsize::new(workers as usize)
 }
 
 /// Writes `[resume_position, remaining]` for the session into `out_hint`,
@@ -320,7 +350,7 @@ pub extern "C" fn seedfinder_scout(
 /// The scout request identifies the world exactly like `seedfinder_scout`, and
 /// the returned UTF-8 JSON `{"matched": [<item indices>],
 /// "matchedRequirements": <n>, "totalRequirements": <n>}` indexes the item
-/// list of the `SSC2` packet `seedfinder_scout` returns for that same request:
+/// list of the `SSC3` packet `seedfinder_scout` returns for that same request:
 /// scouting is deterministic, so both calls describe the same world.
 #[unsafe(no_mangle)]
 pub extern "C" fn seedfinder_scout_matches(
@@ -565,15 +595,10 @@ mod tests {
 
     use super::*;
 
+    /// The request bytes a frontend sends for a query: its canonical JSON
+    /// document — here a +2 Wand of Frost anywhere in the dungeon.
     fn query_packet() -> Vec<u8> {
-        let mut packet = b"SSF9".to_vec();
-        packet.extend_from_slice(&[24, 0, 0, 0, 0, 0, 1, 2, 0, 10]);
-        packet.extend_from_slice(b"wand_frost");
-        // Tier any, upgrade +2 exactly, any effect, any source, no identity
-        // group, no floor limit, no alternative group, no combined-level
-        // group, no flags.
-        packet.extend_from_slice(&[0, 0, 1, 2, 0, 0, 0, 0, 0, 0, 0, 0]);
-        packet
+        br#"{"requirements":[{"item":"wand_frost","upgrade":2}]}"#.to_vec()
     }
 
     unsafe fn take_packet(pointer: *mut u8, len: usize) -> Vec<u8> {
@@ -599,7 +624,7 @@ mod tests {
         );
         assert!(!pointer.is_null());
         let packet = unsafe { take_packet(pointer, len) };
-        assert_eq!(&packet[..4], b"SSC2");
+        assert_eq!(&packet[..4], b"SSC3");
         seedfinder_buffer_free(ptr::null_mut(), 0);
     }
 
@@ -659,7 +684,9 @@ mod tests {
     #[test]
     fn start_poll_status_cancel_close_lifecycle() {
         let request = query_packet();
-        let handle = seedfinder_start_search(request.as_ptr(), request.len());
+        // An explicit worker count and one far beyond the host's parallelism
+        // both start fine; the session clamps.
+        let handle = seedfinder_start_search(request.as_ptr(), request.len(), u32::MAX);
         assert!(handle > 0);
         let mut status = [0; 5];
         assert_eq!(seedfinder_status(handle, status.as_mut_ptr()), OK);
@@ -683,7 +710,7 @@ mod tests {
     #[test]
     fn resumed_search_and_hint_lifecycle() {
         let request = query_packet();
-        let handle = seedfinder_start_search(request.as_ptr(), request.len());
+        let handle = seedfinder_start_search(request.as_ptr(), request.len(), 0);
         assert!(handle > 0);
         seedfinder_cancel(handle);
         // A stopped search keeps reporting state 0 until every queued result
@@ -716,6 +743,7 @@ mod tests {
             request.len(),
             u64::try_from(hint[0]).unwrap(),
             4,
+            1,
         );
         assert!(resumed > 0);
         seedfinder_cancel(resumed);
@@ -723,7 +751,7 @@ mod tests {
 
         // A scan length beyond the seed space is rejected before spawning.
         assert_eq!(
-            seedfinder_start_resumed_search(request.as_ptr(), request.len(), 0, u64::MAX),
+            seedfinder_start_resumed_search(request.as_ptr(), request.len(), 0, u64::MAX, 0),
             0
         );
         assert_eq!(
@@ -993,7 +1021,7 @@ mod tests {
         let link = unsafe { take_packet(pointer, len) };
         assert_eq!(
             std::str::from_utf8(&link).unwrap(),
-            "https://shpd-seed-seeker.web.app/#q=EAGWhMA"
+            "https://shpd-seed-seeker.web.app/#q=QAMtCYAA"
         );
         assert_eq!(
             seedfinder_share_decode(link.as_ptr(), link.len(), &raw mut pointer, &raw mut len),
@@ -1031,8 +1059,8 @@ mod tests {
 
     #[test]
     fn invalid_inputs_are_rejected() {
-        assert_eq!(seedfinder_start_search(ptr::null(), 0), 0);
-        assert_eq!(seedfinder_start_search(b"bad".as_ptr(), 3), 0);
+        assert_eq!(seedfinder_start_search(ptr::null(), 0, 0), 0);
+        assert_eq!(seedfinder_start_search(b"bad".as_ptr(), 3, 0), 0);
         let mut pointer = ptr::null_mut();
         let mut len = 0;
         assert_eq!(

@@ -1,45 +1,51 @@
-//! Exact v3.3.8 randomization of generated weapons, armor, and wands.
+//! Exact v4.0.0 randomization of generated weapons, armor, and wands.
 
 use crate::catalog::{ArmorEffect, Effect, WeaponEffect};
 use crate::rng::RandomStack;
 
-const WEAPON_COMMON: [WeaponEffect; 4] = [
+pub(crate) const WEAPON_COMMON: [WeaponEffect; 5] = [
     WeaponEffect::Blazing,
     WeaponEffect::Chilling,
     WeaponEffect::Kinetic,
     WeaponEffect::Shocking,
+    WeaponEffect::Venomous,
 ];
-const WEAPON_UNCOMMON: [WeaponEffect; 6] = [
+pub(crate) const WEAPON_UNCOMMON: [WeaponEffect; 8] = [
     WeaponEffect::Blocking,
     WeaponEffect::Blooming,
+    WeaponEffect::Eldritch,
     WeaponEffect::Elastic,
     WeaponEffect::Lucky,
     WeaponEffect::Projecting,
     WeaponEffect::Unstable,
+    WeaponEffect::Vorpal,
 ];
-const WEAPON_RARE: [WeaponEffect; 3] = [
+pub(crate) const WEAPON_RARE: [WeaponEffect; 4] = [
     WeaponEffect::Corrupting,
+    WeaponEffect::Crystal,
     WeaponEffect::Grim,
     WeaponEffect::Vampiric,
 ];
-const WEAPON_CURSES: [WeaponEffect; 8] = [
+pub(crate) const WEAPON_CURSES: [WeaponEffect; 10] = [
     WeaponEffect::Annoying,
     WeaponEffect::Displacing,
     WeaponEffect::Dazzling,
     WeaponEffect::Explosive,
+    WeaponEffect::Friendly,
+    WeaponEffect::Polarized,
+    WeaponEffect::Pressurized,
     WeaponEffect::Sacrificial,
     WeaponEffect::Wayward,
-    WeaponEffect::Polarized,
-    WeaponEffect::Friendly,
+    WeaponEffect::Wondrous,
 ];
 
-const ARMOR_COMMON: [ArmorEffect; 4] = [
+pub(crate) const ARMOR_COMMON: [ArmorEffect; 4] = [
     ArmorEffect::Obfuscation,
     ArmorEffect::Swiftness,
     ArmorEffect::Viscosity,
     ArmorEffect::Potential,
 ];
-const ARMOR_UNCOMMON: [ArmorEffect; 6] = [
+pub(crate) const ARMOR_UNCOMMON: [ArmorEffect; 6] = [
     ArmorEffect::Brimstone,
     ArmorEffect::Stone,
     ArmorEffect::Entanglement,
@@ -47,12 +53,12 @@ const ARMOR_UNCOMMON: [ArmorEffect; 6] = [
     ArmorEffect::Camouflage,
     ArmorEffect::Flow,
 ];
-const ARMOR_RARE: [ArmorEffect; 3] = [
+pub(crate) const ARMOR_RARE: [ArmorEffect; 3] = [
     ArmorEffect::Affection,
     ArmorEffect::AntiMagic,
     ArmorEffect::Thorns,
 ];
-const ARMOR_CURSES: [ArmorEffect; 8] = [
+pub(crate) const ARMOR_CURSES: [ArmorEffect; 8] = [
     ArmorEffect::AntiEntropy,
     ArmorEffect::Corrosion,
     ArmorEffect::Displacement,
@@ -148,22 +154,68 @@ fn nested_upgrade_roll(random: &mut RandomStack, first_bound: i32) -> u8 {
     if random.int_bound(5) == 0 { 2 } else { 1 }
 }
 
-/// Mirrors `Weapon.Enchantment.random()` outside an item's `random()` method.
+/// Mirrors `Weapon.Enchantment.random()` with no ignored class.
 pub fn random_weapon_enchantment(random: &mut RandomStack) -> WeaponEffect {
-    match random.chances(&[50.0, 40.0, 10.0]).unwrap_or_default() {
-        0 => select(random, &WEAPON_COMMON),
-        1 => select(random, &WEAPON_UNCOMMON),
-        _ => select(random, &WEAPON_RARE),
-    }
+    random_weapon_enchantment_ignoring(random, None)
 }
 
-/// Mirrors `Armor.Glyph.random()` outside an item's `random()` method.
+/// Mirrors `Weapon.Enchantment.random(toIgnore)`, which `Weapon.enchant()`
+/// calls with the weapon's current enchantment class (possibly a curse). The
+/// rarity is drawn first; the ignored class is then removed from that rarity's
+/// list before `Random.element`. An emptied list falls back to `random()`
+/// without ignores.
+pub fn random_weapon_enchantment_ignoring(
+    random: &mut RandomStack,
+    to_ignore: Option<WeaponEffect>,
+) -> WeaponEffect {
+    let selected = match random.chances(&[50.0, 40.0, 10.0]).unwrap_or_default() {
+        0 => select_ignoring(random, &WEAPON_COMMON, to_ignore),
+        1 => select_ignoring(random, &WEAPON_UNCOMMON, to_ignore),
+        _ => select_ignoring(random, &WEAPON_RARE, to_ignore),
+    };
+    selected.unwrap_or_else(|| random_weapon_enchantment_ignoring(random, None))
+}
+
+/// Mirrors `Armor.Glyph.random()` with no ignored class.
 pub fn random_armor_glyph(random: &mut RandomStack) -> ArmorEffect {
-    match random.chances(&[50.0, 40.0, 10.0]).unwrap_or_default() {
-        0 => select(random, &ARMOR_COMMON),
-        1 => select(random, &ARMOR_UNCOMMON),
-        _ => select(random, &ARMOR_RARE),
+    random_armor_glyph_ignoring(random, None)
+}
+
+/// Mirrors `Armor.Glyph.random(toIgnore)`; see
+/// [`random_weapon_enchantment_ignoring`].
+pub fn random_armor_glyph_ignoring(
+    random: &mut RandomStack,
+    to_ignore: Option<ArmorEffect>,
+) -> ArmorEffect {
+    let selected = match random.chances(&[50.0, 40.0, 10.0]).unwrap_or_default() {
+        0 => select_ignoring(random, &ARMOR_COMMON, to_ignore),
+        1 => select_ignoring(random, &ARMOR_UNCOMMON, to_ignore),
+        _ => select_ignoring(random, &ARMOR_RARE, to_ignore),
+    };
+    selected.unwrap_or_else(|| random_armor_glyph_ignoring(random, None))
+}
+
+/// `Random.element` over `values` minus `to_ignore`; `None` when nothing is
+/// left to draw from (Java then falls back to `random()` with no ignores).
+fn select_ignoring<T: Copy + PartialEq>(
+    random: &mut RandomStack,
+    values: &[T],
+    to_ignore: Option<T>,
+) -> Option<T> {
+    let mut remaining = [None; 10];
+    let mut count = 0_usize;
+    for &value in values {
+        if Some(value) != to_ignore {
+            remaining[count] = Some(value);
+            count += 1;
+        }
     }
+    if count == 0 {
+        return None;
+    }
+    let bound = i32::try_from(count).expect("effect tables are tiny");
+    let index = usize::try_from(random.int_bound(bound)).unwrap_or_default();
+    remaining[index]
 }
 
 fn select<T: Copy>(random: &mut RandomStack, values: &[T]) -> T {
@@ -174,15 +226,52 @@ fn select<T: Copy>(random: &mut RandomStack, values: &[T]) -> T {
 
 #[cfg(test)]
 mod tests {
-    use crate::catalog::{ArmorEffect, Effect, WeaponEffect};
+    use crate::catalog::{
+        ALL_ARMOR_EFFECTS, ALL_WEAPON_EFFECTS, ArmorEffect, Effect, WeaponEffect,
+    };
     use crate::rng::RandomStack;
 
-    use super::{EquipmentRoll, roll_armor, roll_wand, roll_weapon};
+    use super::{
+        ARMOR_COMMON, ARMOR_CURSES, ARMOR_RARE, ARMOR_UNCOMMON, EquipmentRoll, WEAPON_COMMON,
+        WEAPON_CURSES, WEAPON_RARE, WEAPON_UNCOMMON, roll_armor, roll_wand, roll_weapon,
+    };
 
     fn stack(seed: i64) -> RandomStack {
         let mut random = RandomStack::with_base_seed(0);
         random.push(seed);
         random
+    }
+
+    /// The catalog enums (and so the effect wire codes) follow the game
+    /// journal: enchantments by rarity, then the curses. The rarity lists
+    /// here are the source of that order.
+    #[test]
+    fn catalog_order_is_the_journal_order() {
+        let weapon: Vec<WeaponEffect> = WEAPON_COMMON
+            .into_iter()
+            .chain(WEAPON_UNCOMMON)
+            .chain(WEAPON_RARE)
+            .chain(WEAPON_CURSES)
+            .collect();
+        assert_eq!(weapon, ALL_WEAPON_EFFECTS);
+        assert!(
+            weapon
+                .windows(2)
+                .all(|pair| (pair[0] as u8) < (pair[1] as u8))
+        );
+
+        let armor: Vec<ArmorEffect> = ARMOR_COMMON
+            .into_iter()
+            .chain(ARMOR_UNCOMMON)
+            .chain(ARMOR_RARE)
+            .chain(ARMOR_CURSES)
+            .collect();
+        assert_eq!(armor, ALL_ARMOR_EFFECTS);
+        assert!(
+            armor
+                .windows(2)
+                .all(|pair| (pair[0] as u8) < (pair[1] as u8))
+        );
     }
 
     #[test]
@@ -237,7 +326,7 @@ mod tests {
         let weapon_nine = roll_weapon(&mut stack(9));
         assert_eq!(
             weapon_nine.effect,
-            Some(Effect::Weapon(WeaponEffect::Shocking))
+            Some(Effect::Weapon(WeaponEffect::Blazing))
         );
         assert!(!weapon_nine.cursed);
 

@@ -15,7 +15,7 @@ use shpd_seedfinder_core::model::{Accessibility, ItemSource, WorldItem};
 use shpd_seedfinder_core::probability::estimate_match_probability;
 use shpd_seedfinder_core::query::{SearchQuery, decide_start as decide_start_query, scout_matches};
 use shpd_seedfinder_core::quests::{
-    BlacksmithQuestType, GhostQuestType, ImpTarget, QuestSummary, WandmakerQuestType,
+    BlacksmithQuestType, GhostQuestType, ImpQuestType, QuestSummary, WandmakerQuestType,
 };
 use shpd_seedfinder_core::results_export;
 pub use shpd_seedfinder_core::results_export::MAX_RESULTS;
@@ -101,6 +101,11 @@ struct ScoutOutput {
     seed: SeedOutput,
     quests: Vec<ScoutQuestOutput>,
     items: Vec<ScoutItemOutput>,
+    /// The gem each ring class is drawn with in this run, in catalog ring
+    /// order. A ring item's atlas cell is `RING_SPRITE_BASE` plus its class's
+    /// entry; `spriteIndex` below stays the class's own catalog cell, whose
+    /// offset from `RING_SPRITE_BASE` is the class's `item_icons.png` glyph.
+    ring_gems: [u8; 12],
     matched_requirements: usize,
     total_requirements: usize,
 }
@@ -288,7 +293,7 @@ pub fn filter_seeds(query_json: &str, seed_values: Vec<f64>) -> Result<String, J
 }
 
 /// Reports whether the query in `candidate_json` continues the one in
-/// `base_json`: an identical depth, challenge set and fast mode, world
+/// `base_json`: an identical depth and challenge set, world
 /// conditions (the blacksmith flags and the Wandmaker filter) at least as
 /// strict as the base's, and every base requirement covered by a distinct candidate
 /// requirement at least as strict (equal or strengthened). Only a continuing
@@ -541,6 +546,7 @@ fn scout_impl(request_json: &str) -> Result<String, String> {
         seed: seed.into(),
         quests: scout_quest_outputs(world.quests),
         items,
+        ring_gems: world.ring_gems.ordinals(),
         matched_requirements,
         total_requirements,
     }))
@@ -584,8 +590,7 @@ fn scout_quest_outputs(quests: QuestSummary) -> Vec<ScoutQuestOutput> {
         output.push(ScoutQuestOutput {
             quest: "imp",
             variant: match quest.variant {
-                ImpTarget::Monk => "monk",
-                ImpTarget::Golem => "golem",
+                ImpQuestType::Vault => "vault",
             },
             depth: quest.depth,
         });
@@ -639,6 +644,7 @@ const fn item_source_name(source: ItemSource) -> &'static str {
         ItemSource::WandmakerReward => "wandmaker_reward",
         ItemSource::BlacksmithReward => "blacksmith_reward",
         ItemSource::ImpReward => "imp_reward",
+        ItemSource::VaultTreasure => "vault_treasure",
     }
 }
 
@@ -698,7 +704,7 @@ mod tests {
 
     use serde::Deserialize;
     use serde_json::{Value, json};
-    use shpd_seedfinder_core::catalog::item;
+    use shpd_seedfinder_core::catalog::{RING_SPRITE_BASE, item, item_by_stable_id};
     use shpd_seedfinder_core::json_query;
     use shpd_seedfinder_core::main_world::{CanonicalMainWorldGenerator, generate_main_world};
     use shpd_seedfinder_core::search::{SearchOptions, SearchProgress, search_parallel};
@@ -727,11 +733,11 @@ mod tests {
     fn share_links_round_trip_the_canonical_document() {
         let document = r#"{"requirements":[{"item":"wand_fireblast","upgrade":{"at_least":3}}]}"#;
         let link = encode_share_link_impl(document).unwrap();
-        assert_eq!(link, "https://shpd-seed-seeker.web.app/#q=EAGWhMA");
+        assert_eq!(link, "https://shpd-seed-seeker.web.app/#q=QAMtCYAA");
         // Decoding returns the canonical document, which spells out the kind.
         let canonical = r#"{"requirements":[{"item":"wand_fireblast","kind":"wand","upgrade":{"at_least":3}}]}"#;
         assert_eq!(decode_share_text_impl(&link).unwrap(), canonical);
-        assert_eq!(decode_share_text_impl("EAGWhMA").unwrap(), canonical);
+        assert_eq!(decode_share_text_impl("QAMtCYAA").unwrap(), canonical);
         assert!(encode_share_link_impl(r#"{"requirements":[]}"#).is_err());
         assert!(decode_share_text_impl("https://example.com/").is_err());
     }
@@ -826,8 +832,11 @@ mod tests {
         assert_eq!(invalid["valid"], false);
         assert!(invalid["error"].as_str().unwrap().contains("invalid JSON"));
 
+        // A +4 ring exists only in the Imp's vault (floors 17-19), so a
+        // search that stops before it can never match. (An uncursed +4 ring
+        // is possible since 4.0.0: vault prizes are never cursed.)
         let impossible: Value = serde_json::from_str(&analyze_query(
-            r#"{"requirements":[{"kind":"ring","upgrade":4,"uncursed":true}]}"#,
+            r#"{"requirements":[{"kind":"ring","upgrade":4,"uncursed":true}],"max_depth":16}"#,
         ))
         .unwrap();
         assert_eq!(impossible["valid"], true);
@@ -850,8 +859,34 @@ mod tests {
     }
 
     #[test]
+    fn scouting_reports_the_run_gems_that_recolor_its_rings() {
+        // YKH-LGJ-WDQ draws haste as a diamond in the game. The item keeps its
+        // catalog cell — which is what names the class and indexes its glyph —
+        // and the gem table is what moves the art onto the diamond.
+        let output: Value =
+            serde_json::from_str(&scout_impl(r#"{"seed":"YKH-LGJ-WDQ"}"#).unwrap()).unwrap();
+        assert_eq!(
+            output["ringGems"],
+            serde_json::json!([7, 8, 3, 5, 4, 6, 2, 11, 10, 1, 0, 9])
+        );
+
+        let haste = item_by_stable_id("ring_haste").unwrap();
+        assert_eq!(haste.sprite_index, RING_SPRITE_BASE + 7);
+        assert_eq!(haste.ring_glyph_index(), Some(7));
+        let gems = output["ringGems"].as_array().unwrap();
+        let glyph = usize::from(haste.ring_glyph_index().unwrap());
+        let drawn = RING_SPRITE_BASE + u16::try_from(gems[glyph].as_u64().unwrap()).unwrap();
+        assert_eq!(drawn, RING_SPRITE_BASE + 11);
+
+        for output_item in output["items"].as_array().unwrap() {
+            let definition = item_by_stable_id(output_item["id"].as_str().unwrap()).unwrap();
+            assert_eq!(output_item["spriteIndex"], definition.sprite_index);
+        }
+    }
+
+    #[test]
     fn scout_matches_canonical_world_and_android_catalog() {
-        use shpd_seedfinder_core::catalog::{WeaponCategory, item_by_stable_id};
+        use shpd_seedfinder_core::catalog::WeaponCategory;
 
         let output: Value =
             serde_json::from_str(&scout_impl(r#"{"seed":"AAA-AAA-AAA"}"#).unwrap()).unwrap();
@@ -862,15 +897,15 @@ mod tests {
         assert_eq!(
             output["quests"],
             serde_json::json!([
-                { "quest": "ghost", "variant": "great_crab", "depth": 4 },
+                { "quest": "ghost", "variant": "gnoll_trickster", "depth": 3 },
                 { "quest": "wandmaker", "variant": "elemental_embers", "depth": 9 },
                 { "quest": "blacksmith", "variant": "crystal", "depth": 13 },
-                { "quest": "imp", "variant": "golem", "depth": 19 },
+                { "quest": "imp", "variant": "vault", "depth": 19 },
             ])
         );
 
         let catalog: AndroidCatalog = serde_json::from_str(include_str!(
-            "../../../android/app/src/main/assets/third_party/shattered-pixel-dungeon/catalog-v3.3.8.json"
+            "../../../android/app/src/main/assets/third_party/shattered-pixel-dungeon/catalog-v4.0.0.json"
         ))
         .unwrap();
         let sprites = catalog
@@ -902,6 +937,18 @@ mod tests {
                         WeaponCategory::Thrown => "thrown",
                     });
             assert_eq!(entry.class.as_deref(), expected, "{}", entry.id);
+        }
+
+        // The frontends keep tipped darts out of their item pickers by the
+        // `_dart` id suffix, so the suffix must name exactly the core's
+        // tipped-dart set.
+        for entry in &catalog.entries {
+            assert_eq!(
+                entry.id.ends_with("_dart"),
+                item_by_stable_id(&entry.id).unwrap().id.is_tipped_dart(),
+                "{}",
+                entry.id
+            );
         }
     }
 
@@ -945,7 +992,10 @@ mod tests {
             &query,
             SearchOptions {
                 start_seed: 0,
-                end_seed_exclusive: 2_000,
+                // An upgraded ring matches every few seeds, so this small
+                // range still mixes kept and dropped candidates while staying
+                // affordable in an unoptimised test build.
+                end_seed_exclusive: 200,
                 workers: NonZeroUsize::MIN,
                 chunk_size: NonZeroUsize::new(64).unwrap(),
                 max_results: NonZeroUsize::new(MAX_RESULTS).unwrap(),
@@ -960,7 +1010,7 @@ mod tests {
         assert!(!matches.is_empty());
 
         #[allow(clippy::cast_precision_loss)]
-        let candidates = (0..2_000_u64).map(|seed| seed as f64).collect::<Vec<_>>();
+        let candidates = (0..200_u64).map(|seed| seed as f64).collect::<Vec<_>>();
         let output: Value =
             serde_json::from_str(&filter_seeds_impl(query_json, &candidates).unwrap()).unwrap();
         let kept = output
@@ -992,7 +1042,11 @@ mod tests {
             &query,
             SearchOptions {
                 start_seed: 0,
-                end_seed_exclusive: 20_000,
+                // Seeds 104, 164, 224 and 289 award this wand, so the range
+                // holds several matches while the two sides still cut their
+                // chunks at different, non-aligned boundaries. Anything much
+                // larger turns an unoptimised test build into minutes of CI.
+                end_seed_exclusive: 300,
                 workers: NonZeroUsize::MIN,
                 chunk_size: NonZeroUsize::new(137).unwrap(),
                 max_results: NonZeroUsize::new(MAX_RESULTS).unwrap(),
@@ -1004,8 +1058,9 @@ mod tests {
         .into_iter()
         .map(|world| world.seed.value())
         .collect::<Vec<_>>();
+        assert!(!parallel.is_empty());
 
-        let mut session = SearchSession::new_impl(query_json, 0.0, 20_000.0).unwrap();
+        let mut session = SearchSession::new_impl(query_json, 0.0, 300.0).unwrap();
         let mut cooperative = Vec::new();
         loop {
             let output: Value = serde_json::from_str(&session.advance(113)).unwrap();
