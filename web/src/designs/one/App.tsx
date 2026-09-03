@@ -466,12 +466,12 @@ export default function App() {
         <span className="d1-footer-sep" aria-hidden="true">
           ·
         </span>
-        <a href="/licenses/COPYING.txt">License</a>
+        <a href={`${import.meta.env.BASE_URL}licenses/COPYING.txt`}>License</a>
         <span className="d1-footer-sep" aria-hidden="true">
           ·
         </span>
-        <a href="/third_party/shattered-pixel-dungeon/ATTRIBUTION.md">
-          <span className="d1-footer-wide">Asset attribution</span>
+        <a href={`${import.meta.env.BASE_URL}third_party/shattered-pixel-dungeon/ATTRIBUTION.md`}>
+        <span className="d1-footer-wide">Asset attribution</span>
           <span className="d1-footer-narrow">Attribution</span>
         </a>
         <FooterStatus />
